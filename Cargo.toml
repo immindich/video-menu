@@ -1,0 +1,8 @@
+[package]
+name = "video-menu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openvino = "0.11.1"
+pipewire = { version = "0.10.1", features = ["v0_3_34"] }
