@@ -5,8 +5,11 @@
 //! streaming from the virtual node; otherwise it stays idle (and suspended).
 //!
 //! Usage: `video-menu [CAMERA_NODE_NAME]`. Without an argument, the first
-//! camera found in the graph is used.
+//! camera found in the graph is used; if there is none, the daemon starts
+//! with no camera selected. When run in a terminal, cameras can be switched
+//! with commands on stdin (see [`commands`]).
 
+mod commands;
 mod model;
 mod relay;
 
@@ -15,7 +18,7 @@ use std::error::Error;
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, probe_formats, roundtrip};
+use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, roundtrip};
 
 fn main() -> Result<(), Box<dyn Error>> {
     pw::init();
@@ -27,14 +30,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let core = context.connect_rc(None)?;
 
     let sources = VideoSources::watch(&core)?;
-    roundtrip(&mainloop, &core)?;
-    let (id, camera) = sources.select(target.as_deref())?;
-    let formats = probe_formats(&mainloop, &core, &sources, id)?;
-    eprintln!("using camera {camera} ({} formats)", formats.len());
+    roundtrip(&mainloop, &core)?; // the initial sources
+    roundtrip(&mainloop, &core)?; // their formats
+    let initial = sources.select(target.as_deref())?;
 
-    let relay = CameraRelay::new(&core, sources, &camera)?;
+    let relay = CameraRelay::new(&core, sources)?;
     let _listeners = relay.listen()?;
-    relay.publish(&formats)?;
+    match &initial {
+        Some(camera) => relay.set_camera(Some(camera))?,
+        None => eprintln!("no camera found; starting unconnected"),
+    }
+    relay.publish()?;
+    let _commands = commands::attach(&mainloop, relay.clone());
 
     eprintln!("virtual camera {OUTPUT_NODE_NAME} ready");
     mainloop.run();

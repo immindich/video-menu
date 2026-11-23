@@ -14,8 +14,9 @@ use pw::{
     core::CoreRc,
     main_loop::MainLoopRc,
     node::Node,
-    properties::{PropertiesBox, properties},
-    registry::{GlobalObject, RegistryRc},
+    node::NodeListener,
+    properties::properties,
+    registry::RegistryRc,
     spa,
     stream::{StreamFlags, StreamListener, StreamRc, StreamState},
     types::ObjectType,
@@ -24,10 +25,14 @@ use spa::{
     buffer::meta::MetaHeader,
     param::{
         ParamType,
+        format::{FormatProperties, MediaSubtype, MediaType},
         video::{VideoFormat, VideoInfoRaw},
     },
     pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer},
-    utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, SpaTypes},
+    utils::{
+        Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes,
+        result::SpaResult,
+    },
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -59,11 +64,15 @@ struct State {
 ///
 /// `input` captures from the real camera; `output` is the virtual camera node
 /// that applications read from. The camera is only captured from while an
-/// application is streaming from `output`.
+/// application is streaming from `output`. The relay may have no camera
+/// selected, in which case `output` advertises generic formats and produces
+/// no frames; see [`set_camera`](Self::set_camera).
 pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
     state: RefCell<State>,
+    /// Name of the video source being relayed, if any.
+    camera: RefCell<Option<String>>,
     /// Live list of video sources the relay could capture from.
     sources: VideoSources,
     /// Origin for fallback timestamps when the camera provides none.
@@ -77,9 +86,10 @@ pub struct RelayListeners {
 }
 
 impl CameraRelay {
-    /// Create the capture and virtual camera streams. Nothing appears in the
-    /// graph until [`publish`](Self::publish) is called.
-    pub fn new(core: &CoreRc, sources: VideoSources, camera: &str) -> Result<Rc<Self>, pw::Error> {
+    /// Create the capture and virtual camera streams, with no camera
+    /// selected. Nothing appears in the graph until
+    /// [`publish`](Self::publish) is called.
+    pub fn new(core: &CoreRc, sources: VideoSources) -> Result<Rc<Self>, pw::Error> {
         let input = StreamRc::new(
             core.clone(),
             "video-menu-capture",
@@ -88,7 +98,6 @@ impl CameraRelay {
                 *pw::keys::MEDIA_TYPE => "Video",
                 *pw::keys::MEDIA_CATEGORY => "Capture",
                 *pw::keys::MEDIA_ROLE => "Camera",
-                "target.object" => camera,
             },
         )?;
 
@@ -108,6 +117,7 @@ impl CameraRelay {
             input,
             output,
             state: RefCell::default(),
+            camera: RefCell::default(),
             sources,
             start: Instant::now(),
         }))
@@ -116,6 +126,62 @@ impl CameraRelay {
     /// The video sources currently in the graph.
     pub fn sources(&self) -> &VideoSources {
         &self.sources
+    }
+
+    /// Name of the video source being relayed, if any.
+    pub fn camera(&self) -> Option<String> {
+        self.camera.borrow().clone()
+    }
+
+    /// Relay from the video source called `name`, or from nothing if `None`.
+    ///
+    /// The virtual camera's advertised formats are replaced with the new
+    /// source's (or generic ones), so a consumer that is already streaming
+    /// renegotiates if its format is no longer offered. Fails, leaving the
+    /// current selection alone, if `name` is unknown or its formats have not
+    /// been probed.
+    pub fn set_camera(&self, name: Option<&str>) -> Result<(), Box<dyn Error>> {
+        let formats = match name {
+            Some(name) => {
+                let formats = self
+                    .sources
+                    .formats(name)
+                    .ok_or_else(|| format!("no video source named {name}"))?;
+                if formats.is_empty() {
+                    return Err(format!("video source {name} reported no formats").into());
+                }
+                formats
+            }
+            None => vec![generic_formats()],
+        };
+
+        self.stop_capture();
+        self.set_target(name.unwrap_or(""))?;
+        *self.camera.borrow_mut() = name.map(str::to_owned);
+        match name {
+            Some(name) => eprintln!("relay: using {name} ({} formats)", formats.len()),
+            None => eprintln!("relay: no camera"),
+        }
+
+        let mut params: Vec<&Pod> = formats
+            .iter()
+            .filter_map(|bytes| Pod::from_bytes(bytes))
+            .collect();
+        self.output.update_params(&mut params)?;
+
+        self.resume_capture();
+        Ok(())
+    }
+
+    /// Point the capture stream at `target`. Takes effect on the next connect.
+    fn set_target(&self, target: &str) -> Result<(), pw::Error> {
+        let props = properties! { "target.object" => target };
+        // The safe stream wrapper does not expose pw_stream_update_properties.
+        let res = unsafe {
+            pw::sys::pw_stream_update_properties(self.input.as_raw_ptr(), props.dict().as_raw_ptr())
+        };
+        SpaResult::from_c(res).into_sync_result()?;
+        Ok(())
     }
 
     /// Register the stream callbacks. Each listener holds its own `Rc` to the
@@ -155,8 +221,14 @@ impl CameraRelay {
         })
     }
 
-    /// Add the virtual camera to the graph, offering the camera's formats.
-    pub fn publish(&self, formats: &[Vec<u8>]) -> Result<(), pw::Error> {
+    /// Add the virtual camera to the graph, offering the selected camera's
+    /// formats, or generic ones if no camera is selected.
+    pub fn publish(&self) -> Result<(), pw::Error> {
+        let formats = self
+            .camera()
+            .and_then(|name| self.sources.formats(&name))
+            .filter(|formats| !formats.is_empty())
+            .unwrap_or_else(|| vec![generic_formats()]);
         let mut params: Vec<&Pod> = formats
             .iter()
             .filter_map(|bytes| Pod::from_bytes(bytes))
@@ -251,6 +323,9 @@ impl CameraRelay {
 
     /// Connect the capture stream to the camera with the consumer's format.
     fn start_capture(&self) {
+        if self.camera.borrow().is_none() {
+            return;
+        }
         let pod = {
             let st = self.state.borrow();
             if st.capturing {
@@ -273,6 +348,15 @@ impl CameraRelay {
                 self.state.borrow_mut().capturing = true;
             }
             Err(e) => eprintln!("capture: connect failed: {e}"),
+        }
+    }
+
+    /// Start capturing if a consumer is streaming from us. Covers cases where
+    /// no `Streaming` state transition follows, such as a camera switch or a
+    /// renegotiation while already streaming.
+    fn resume_capture(&self) {
+        if self.output.state() == StreamState::Streaming {
+            self.start_capture();
         }
     }
 
@@ -347,6 +431,7 @@ impl CameraRelay {
         if let Err(e) = self.output.update_params(&mut params) {
             eprintln!("camera: update_params failed: {e}");
         }
+        self.resume_capture();
     }
 
     /// The virtual camera's graph is running a cycle: hand out the latest frame.
@@ -410,6 +495,45 @@ fn bytes_per_pixel(format: VideoFormat) -> Option<usize> {
         .iter()
         .find(|(formats, _)| formats.contains(&format))
         .map(|&(_, bpp)| bpp)
+}
+
+/// An EnumFormat pod offering common packed formats at any size, advertised
+/// while no camera is selected.
+fn generic_formats() -> Vec<u8> {
+    serialize(spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        spa::pod::property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::YUY2,
+            VideoFormat::YUY2,
+            VideoFormat::RGBx,
+            VideoFormat::BGRx
+        ),
+        spa::pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle { width: 1280, height: 720 },
+            Rectangle { width: 1, height: 1 },
+            Rectangle { width: 4096, height: 4096 }
+        ),
+        spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction { num: 30, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction { num: 120, denom: 1 }
+        ),
+    ))
 }
 
 /// Re-tag a negotiated Format pod as an EnumFormat pod so it can be offered to
@@ -548,20 +672,28 @@ pub fn roundtrip(mainloop: &MainLoopRc, core: &CoreRc) -> Result<(), pw::Error> 
 pub struct VideoSource {
     pub name: String,
     pub is_camera: bool,
-    global: GlobalObject<PropertiesBox>,
+    /// EnumFormat pods the node supports, filled in asynchronously after the
+    /// node appears.
+    formats: Rc<RefCell<Vec<Vec<u8>>>>,
+    _node: Node,
+    _node_listener: NodeListener,
 }
 
 /// Live list of the graph's `Video/Source` nodes, excluding our own virtual
-/// camera. Kept up to date by registry events for as long as it is alive.
+/// camera, with the formats each supports. Kept up to date by registry
+/// events for as long as it is alive.
 pub struct VideoSources {
-    registry: RegistryRc,
+    /// Owned here; the registry callback only holds a weak reference, which
+    /// avoids a cycle through the listener.
+    _registry: RegistryRc,
     list: Rc<RefCell<BTreeMap<u32, VideoSource>>>,
     _listener: pw::registry::Listener,
 }
 
 impl VideoSources {
-    /// Start tracking video sources. The initial list is filled in as the
-    /// main loop runs; call [`roundtrip`] to wait for it to be complete.
+    /// Start tracking video sources. Sources and their formats are filled in
+    /// as the main loop runs: after one [`roundtrip`] the initial sources are
+    /// known, after a second their formats are too.
     pub fn watch(core: &CoreRc) -> Result<Self, pw::Error> {
         let registry = core.get_registry_rc()?;
         let list = Rc::new(RefCell::new(BTreeMap::new()));
@@ -569,6 +701,7 @@ impl VideoSources {
             .add_listener_local()
             .global({
                 let list = list.clone();
+                let registry = registry.downgrade();
                 move |global| {
                     if global.type_ != ObjectType::Node {
                         return;
@@ -583,13 +716,44 @@ impl VideoSources {
                     if name == OUTPUT_NODE_NAME {
                         return;
                     }
+                    let Some(registry) = registry.upgrade() else {
+                        return;
+                    };
+                    let node: Node = match registry.bind(global) {
+                        Ok(node) => node,
+                        Err(e) => {
+                            eprintln!("sources: cannot bind {name}: {e}");
+                            return;
+                        }
+                    };
+                    let formats = Rc::new(RefCell::new(Vec::new()));
+                    let node_listener = node
+                        .add_listener_local()
+                        .param({
+                            let formats = formats.clone();
+                            move |_, id, _, _, param| {
+                                let Some(param) = param else { return };
+                                let is_video = matches!(
+                                    spa::param::format_utils::parse_format(param),
+                                    Ok((MediaType::Video, MediaSubtype::Raw))
+                                );
+                                if id == ParamType::EnumFormat && is_video {
+                                    formats.borrow_mut().push(param.as_bytes().to_vec());
+                                }
+                            }
+                        })
+                        .register();
+                    node.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
+
                     eprintln!("sources: added {name}");
                     list.borrow_mut().insert(
                         global.id,
                         VideoSource {
                             name: name.to_owned(),
                             is_camera: props.get(*pw::keys::MEDIA_ROLE) == Some("Camera"),
-                            global: global.to_owned(),
+                            formats,
+                            _node: node,
+                            _node_listener: node_listener,
                         },
                     );
                 }
@@ -604,76 +768,53 @@ impl VideoSources {
             })
             .register();
         Ok(Self {
-            registry,
+            _registry: registry,
             list,
             _listener: listener,
         })
     }
 
-    /// Names of the currently known video sources.
-    pub fn names(&self) -> Vec<String> {
-        self.list.borrow().values().map(|s| s.name.clone()).collect()
+    /// Names of the currently known video sources and whether each has the
+    /// Camera role.
+    pub fn list(&self) -> Vec<(String, bool)> {
+        self.list
+            .borrow()
+            .values()
+            .map(|s| (s.name.clone(), s.is_camera))
+            .collect()
     }
 
-    /// Pick the source to relay: `target` by name if given, otherwise the
-    /// first camera, otherwise the first video source. Returns its global id
-    /// and name.
-    pub fn select(&self, target: Option<&str>) -> Result<(u32, String), Box<dyn Error>> {
+    /// Formats supported by the source called `name`, if it exists. Empty if
+    /// they have not been received yet.
+    pub fn formats(&self, name: &str) -> Option<Vec<Vec<u8>>> {
+        self.list
+            .borrow()
+            .values()
+            .find(|s| s.name == name)
+            .map(|s| s.formats.borrow().clone())
+    }
+
+    /// Pick the source to relay at startup: `target` by name if given,
+    /// otherwise the first camera, otherwise the first video source.
+    /// Returns `None` if there are no sources and no target was asked for.
+    pub fn select(&self, target: Option<&str>) -> Result<Option<String>, Box<dyn Error>> {
         let list = self.list.borrow();
         let found = match target {
-            Some(target) => list.iter().find(|(_, s)| s.name == target),
-            None => list
-                .iter()
-                .find(|(_, s)| s.is_camera)
-                .or(list.iter().next()),
-        };
-        match found {
-            Some((&id, source)) => Ok((id, source.name.clone())),
-            None => Err(format!(
-                "camera not found; available video sources: {:?}",
-                self.names()
-            )
-            .into()),
-        }
-    }
-
-    /// Bind a proxy for the source with global `id`.
-    fn bind(&self, id: u32) -> Result<Node, Box<dyn Error>> {
-        let list = self.list.borrow();
-        let source = list
-            .get(&id)
-            .ok_or_else(|| format!("video source {id} disappeared"))?;
-        Ok(self.registry.bind(&source.global)?)
-    }
-}
-
-/// Collect the formats the source with global `id` supports, so the virtual
-/// camera can advertise the same ones without opening the device.
-pub fn probe_formats(
-    mainloop: &MainLoopRc,
-    core: &CoreRc,
-    sources: &VideoSources,
-    id: u32,
-) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
-    let node = sources.bind(id)?;
-    let formats = Rc::new(RefCell::new(Vec::new()));
-    let _node_listener = node
-        .add_listener_local()
-        .param({
-            let formats = formats.clone();
-            move |_, id, _, _, param| {
-                if let (ParamType::EnumFormat, Some(param)) = (id, param) {
-                    formats.borrow_mut().push(param.as_bytes().to_vec());
+            Some(target) => match list.values().find(|s| s.name == target) {
+                Some(source) => Some(source),
+                None => {
+                    let names: Vec<&str> = list.values().map(|s| s.name.as_str()).collect();
+                    return Err(format!(
+                        "camera {target} not found; available video sources: {names:?}"
+                    )
+                    .into());
                 }
-            }
-        })
-        .register();
-    node.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
-    roundtrip(mainloop, core)?;
-
-    let formats = formats.take();
-    if formats.is_empty() {
-        return Err(format!("video source {id} reported no formats").into());
+            },
+            None => list
+                .values()
+                .find(|s| s.is_camera)
+                .or(list.values().next()),
+        };
+        Ok(found.map(|s| s.name.clone()))
     }
-    Ok(formats)
 }
