@@ -15,7 +15,14 @@ struct Params {
     r_shift: u32,
     g_shift: u32,
     b_shift: u32,
-    _pad: u32,
+    _pad0: u32,
+    // Resolution the matting model runs at.
+    small_w: u32,
+    small_h: u32,
+    _pad1: u32,
+    _pad2: u32,
+    // Background colour for green_screen.
+    bg: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -23,6 +30,10 @@ struct Params {
 // Three planes (R, G, B) of width*height samples in 0..1.
 @group(0) @binding(2) var<storage, read_write> planar: array<f32>;
 @group(0) @binding(3) var<storage, read_write> dst: array<u32>;
+// The frame at model resolution: three planes of f16, two per word.
+@group(0) @binding(4) var<storage, read_write> small: array<u32>;
+// The model's coefficients A then b: eight planes of f16 at model resolution.
+@group(0) @binding(5) var<storage, read> coef: array<u32>;
 
 fn byte_at(word: u32, shift: u32) -> f32 {
     return f32((word >> shift) & 0xffu);
@@ -105,4 +116,82 @@ fn pack_yuy2(@builtin(global_invocation_id) id: vec3<u32>) {
     let u = to_u8(128.0 + dot(m, vec3<f32>(-37.797, -74.203, 112.0)));
     let v = to_u8(128.0 + dot(m, vec3<f32>(112.0, -93.786, -18.214)));
     dst[id.y * p.dst_words + id.x] = luma(a) | (u << 8u) | (luma(b) << 16u) | (v << 24u);
+}
+
+// ---- matting (see GreenScreen in pipeline.rs) ----
+
+struct Tap {
+    i0: u32,
+    i1: u32,
+    w: f32,
+}
+
+// Bilinear tap for output sample i when resampling n_in samples to n_out,
+// as PyTorch does with align_corners=False. Mirrors taps() in pipeline.rs.
+fn tap(i: u32, n_in: u32, n_out: u32) -> Tap {
+    let scale = f32(n_in) / f32(n_out);
+    let x = clamp((f32(i) + 0.5) * scale - 0.5, 0.0, f32(n_in - 1u));
+    let i0 = u32(x);
+    return Tap(i0, min(i0 + 1u, n_in - 1u), x - f32(i0));
+}
+
+fn planar_at(c: u32, x: u32, y: u32) -> f32 {
+    return planar[c * p.width * p.height + y * p.width + x];
+}
+
+// Bilinear sample of full-resolution plane c (vertical, then horizontal,
+// like resample() in pipeline.rs).
+fn sample_planar(c: u32, tx: Tap, ty: Tap) -> f32 {
+    let left = planar_at(c, tx.i0, ty.i0) * (1.0 - ty.w) + planar_at(c, tx.i0, ty.i1) * ty.w;
+    let right = planar_at(c, tx.i1, ty.i0) * (1.0 - ty.w) + planar_at(c, tx.i1, ty.i1) * ty.w;
+    return left * (1.0 - tx.w) + right * tx.w;
+}
+
+// One invocation per horizontal pair of model-resolution pixels.
+@compute @workgroup_size(16, 16)
+fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x * 2u >= p.small_w || id.y >= p.small_h) {
+        return;
+    }
+    let x = id.x * 2u;
+    let ty = tap(id.y, p.height, p.small_h);
+    let t0 = tap(x, p.width, p.small_w);
+    let t1 = tap(x + 1u, p.width, p.small_w);
+    let plane_words = p.small_w * p.small_h / 2u;
+    let word = (id.y * p.small_w + x) / 2u;
+    for (var c = 0u; c < 3u; c++) {
+        let v = vec2<f32>(sample_planar(c, t0, ty), sample_planar(c, t1, ty));
+        small[c * plane_words + word] = pack2x16float(v);
+    }
+}
+
+fn coef_at(k: u32, x: u32, y: u32) -> f32 {
+    let i = k * p.small_w * p.small_h + y * p.small_w + x;
+    return unpack2x16float(coef[i / 2u])[i % 2u];
+}
+
+fn sample_coef(k: u32, tx: Tap, ty: Tap) -> f32 {
+    let left = coef_at(k, tx.i0, ty.i0) * (1.0 - ty.w) + coef_at(k, tx.i0, ty.i1) * ty.w;
+    let right = coef_at(k, tx.i1, ty.i0) * (1.0 - ty.w) + coef_at(k, tx.i1, ty.i1) * ty.w;
+    return left * (1.0 - tx.w) + right * tx.w;
+}
+
+// One invocation per pixel: upsample the coefficients, apply them to the
+// pixel to get its foreground colour and alpha, and composite over bg.
+@compute @workgroup_size(16, 16)
+fn green_screen(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p.width || id.y >= p.height) {
+        return;
+    }
+    let tx = tap(id.x, p.small_w, p.width);
+    let ty = tap(id.y, p.small_h, p.height);
+    let i = id.y * p.width + id.x;
+    let rgb = load_rgb(i);
+    let x = vec4<f32>(rgb, (rgb.r + rgb.g + rgb.b) * (1.0 / 3.0));
+    let a = vec4<f32>(sample_coef(0u, tx, ty), sample_coef(1u, tx, ty), sample_coef(2u, tx, ty), sample_coef(3u, tx, ty));
+    let b = vec4<f32>(sample_coef(4u, tx, ty), sample_coef(5u, tx, ty), sample_coef(6u, tx, ty), sample_coef(7u, tx, ty));
+    let out = a * x + b;
+    let pha = clamp(out.a, 0.0, 1.0);
+    let fgr = clamp(out.rgb + rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    store_rgb(i, fgr * pha + p.bg.rgb * (1.0 - pha));
 }

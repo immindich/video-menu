@@ -1,10 +1,11 @@
 //! Virtual camera daemon.
 //!
 //! Exposes a PipeWire `Video/Source` node that mirrors a real webcam. Frames
-//! are converted to planar RGB, run through effects (currently a vertical
-//! flip as a placeholder), and offered to applications as YUY2. The real
-//! camera is only opened while some client is actually streaming from the
-//! virtual node; otherwise it stays idle (and suspended).
+//! are converted to planar RGB, their background is replaced with green
+//! using a matting model (RVM, on the NPU), and they are offered to
+//! applications as YUY2. The real camera is only opened while some client
+//! is actually streaming from the virtual node; otherwise it stays idle (and
+//! suspended).
 //!
 //! Usage: `video-menu [CAMERA_NODE_NAME]`. Without an argument, the first
 //! camera found in the graph is used; if there is none, the daemon starts
@@ -13,6 +14,9 @@
 //!
 //! Frames are processed on the GPU (Vulkan via wgpu) when one is available,
 //! otherwise on the CPU; set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force one.
+//! `VIDEO_MENU_EFFECT=flip` flips frames instead of running the model, and
+//! `VIDEO_MENU_MODEL` / `VIDEO_MENU_MODEL_DEVICE` choose the model file and
+//! the device it runs on (default: the NPU).
 
 mod commands;
 mod formats;
@@ -27,7 +31,8 @@ use std::error::Error;
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use processor::Processor;
+use model::RvmMatte;
+use processor::{Effects, Processor};
 use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, roundtrip};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -44,7 +49,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     roundtrip(&mainloop, &core)?; // their formats
     let initial = sources.select(target.as_deref())?;
 
-    let processor = Processor::from_env()?;
+    let effects = match std::env::var("VIDEO_MENU_EFFECT").as_deref() {
+        Ok("flip") => Effects::Flip,
+        Ok("green") | Ok("") | Err(_) => {
+            let matte = RvmMatte::from_env()?;
+            eprintln!("matting model running on the {}", matte.device());
+            Effects::GreenScreen(Box::new(matte))
+        }
+        Ok(other) => return Err(format!("VIDEO_MENU_EFFECT must be green or flip, not {other:?}").into()),
+    };
+    let processor = Processor::from_env(effects)?;
     eprintln!("processing frames on the {}", processor.describe());
     let relay = CameraRelay::new(&core, sources, processor)?;
     let _listeners = relay.listen()?;

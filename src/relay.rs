@@ -76,12 +76,14 @@ struct State {
 #[derive(Default)]
 struct Timing {
     frames: u32,
-    stages: [Duration; 4],
+    /// Camera frames dropped because processing fell behind.
+    skipped: u32,
+    stages: [Duration; 5],
     since: Option<Instant>,
 }
 
 impl Timing {
-    fn record(&mut self, stages: [Duration; 4], names: [&str; 4]) {
+    fn record(&mut self, stages: [Duration; 5], names: [&str; 5]) {
         self.frames += 1;
         for (total, t) in self.stages.iter_mut().zip(stages) {
             *total += t;
@@ -90,7 +92,7 @@ impl Timing {
         if since.elapsed() >= TIMING_INTERVAL {
             let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames as f64;
             let total: Duration = self.stages.iter().sum();
-            // Skip stages that took no time at all (decode, for raw frames).
+            // Skip stages that took no time at all (e.g. decode, for raw frames).
             let stages: Vec<String> = names
                 .iter()
                 .zip(self.stages)
@@ -98,8 +100,9 @@ impl Timing {
                 .map(|(n, t)| format!("{n} {:.2}", ms(t)))
                 .collect();
             eprintln!(
-                "pipeline: {} frames, {:.2} ms/frame ({})",
+                "pipeline: {} frames ({} skipped), {:.2} ms/frame ({})",
                 self.frames,
+                self.skipped,
                 ms(total),
                 stages.join(", ")
             );
@@ -214,6 +217,8 @@ impl CameraRelay {
         };
 
         self.stop_capture();
+        // The model's temporal state describes the old camera's scene.
+        self.processor.borrow_mut().reset();
         self.set_target(name.unwrap_or(""))?;
         *self.camera.borrow_mut() = name.map(str::to_owned);
         match name {
@@ -360,6 +365,14 @@ impl CameraRelay {
         let Some(mut buffer) = self.input.dequeue_buffer() else {
             return;
         };
+        // Processing can take longer than the camera's frame interval (the
+        // model alone takes ~20 ms). Skip to the newest frame rather than
+        // working through a backlog; dropping a buffer requeues it.
+        let mut skipped = 0;
+        while let Some(newer) = self.input.dequeue_buffer() {
+            buffer = newer;
+            skipped += 1;
+        }
         // Consumers (e.g. GStreamer's pipewiresrc) timestamp frames from the
         // header meta; without advancing pts they show a still image.
         let header = buffer.find_meta::<MetaHeader>().map(|h| (h.pts(), h.seq()));
@@ -380,6 +393,7 @@ impl CameraRelay {
 
         {
             let st = &mut *self.state.borrow_mut();
+            st.timing.skipped += skipped;
             let (Some(format), Some(input)) = (st.format, st.input) else {
                 return;
             };

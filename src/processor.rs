@@ -12,8 +12,33 @@ use pipewire::spa::param::video::VideoFormat;
 
 use crate::{
     gpu::{GpuEffect, GpuProcessor},
-    pipeline::{self, Effect, InputFormat, PlanarFrame, VerticalFlip},
+    model::Matte,
+    pipeline::{self, Effect, GreenScreen, InputFormat, PlanarFrame, VerticalFlip},
 };
+
+/// What to do to each frame.
+pub enum Effects {
+    /// Flip upside down; a cheap stand-in for testing.
+    Flip,
+    /// Replace the background with green using a matting model.
+    GreenScreen(Box<dyn Matte>),
+}
+
+impl Effects {
+    fn for_cpu(self) -> Vec<Box<dyn Effect>> {
+        match self {
+            Self::Flip => vec![Box::new(VerticalFlip)],
+            Self::GreenScreen(matte) => vec![Box::new(GreenScreen::new(matte))],
+        }
+    }
+
+    fn for_gpu(self) -> Vec<GpuEffect> {
+        match self {
+            Self::Flip => vec![GpuEffect::VerticalFlip],
+            Self::GreenScreen(matte) => vec![GpuEffect::GreenScreen(matte)],
+        }
+    }
+}
 
 /// The encoding of an incoming camera frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,31 +70,47 @@ impl Processor {
         Self { backend, jpeg: None, decoded: Vec::new() }
     }
 
-    pub fn cpu() -> Self {
+    pub fn cpu(effects: Effects) -> Self {
         Self::with_backend(Backend::Cpu(CpuBackend {
             planar: PlanarFrame::default(),
-            effects: vec![Box::new(VerticalFlip)],
+            effects: effects.for_cpu(),
         }))
     }
 
-    pub fn gpu() -> Result<Self, Box<dyn std::error::Error>> {
-        let gpu = GpuProcessor::new(vec![GpuEffect::VerticalFlip])?;
-        Ok(Self::with_backend(Backend::Gpu(Box::new(gpu))))
+    #[cfg(test)]
+    pub fn gpu(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::on_gpu(GpuProcessor::new()?, effects))
+    }
+
+    fn on_gpu(mut gpu: GpuProcessor, effects: Effects) -> Self {
+        gpu.set_effects(effects.for_gpu());
+        Self::with_backend(Backend::Gpu(Box::new(gpu)))
     }
 
     /// The backend chosen by `VIDEO_MENU_BACKEND`, defaulting to the GPU with
     /// a fallback to the CPU.
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        match std::env::var("VIDEO_MENU_BACKEND").as_deref() {
-            Ok("cpu") => Ok(Self::cpu()),
-            Ok("gpu") => Self::gpu(),
+    pub fn from_env(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
+        let gpu = match std::env::var("VIDEO_MENU_BACKEND").as_deref() {
+            Ok("cpu") => None,
+            Ok("gpu") => Some(GpuProcessor::new()?),
             Ok(other) if !other.is_empty() => {
-                Err(format!("VIDEO_MENU_BACKEND must be cpu or gpu, not {other:?}").into())
+                return Err(format!("VIDEO_MENU_BACKEND must be cpu or gpu, not {other:?}").into());
             }
-            _ => Ok(Self::gpu().unwrap_or_else(|e| {
-                eprintln!("processor: no GPU ({e}); using the CPU");
-                Self::cpu()
-            })),
+            _ => GpuProcessor::new()
+                .map_err(|e| eprintln!("processor: no GPU ({e}); using the CPU"))
+                .ok(),
+        };
+        Ok(match gpu {
+            Some(gpu) => Self::on_gpu(gpu, effects),
+            None => Self::cpu(effects),
+        })
+    }
+
+    /// Forget effects' temporal state, e.g. after switching cameras.
+    pub fn reset(&mut self) {
+        match &mut self.backend {
+            Backend::Cpu(cpu) => cpu.effects.iter_mut().for_each(|e| e.reset()),
+            Backend::Gpu(gpu) => gpu.reset(),
         }
     }
 
@@ -80,12 +121,12 @@ impl Processor {
         }
     }
 
-    /// Names of the four stages [`process`](Self::process) times. The first,
-    /// `decode`, is zero for raw frames.
-    pub fn stage_names(&self) -> [&'static str; 4] {
+    /// Names of the stages [`process`](Self::process) times. `decode` is
+    /// zero for raw frames and `model` without a model-based effect.
+    pub fn stage_names(&self) -> [&'static str; 5] {
         match &self.backend {
-            Backend::Cpu(_) => ["decode", "unpack", "effects", "pack"],
-            Backend::Gpu(_) => ["decode", "upload", "gpu", "readback"],
+            Backend::Cpu(_) => ["decode", "unpack", "effects", "model", "pack"],
+            Backend::Gpu(_) => ["decode", "upload", "gpu", "model", "readback"],
         }
     }
 
@@ -103,7 +144,7 @@ impl Processor {
         height: usize,
         dst: &mut [u8],
         dst_stride: usize,
-    ) -> Result<[Duration; 4], String> {
+    ) -> Result<[Duration; 5], String> {
         let (input, src, src_stride, decode) = match format {
             FrameFormat::Raw(input) => (input, src, src_stride, Duration::ZERO),
             FrameFormat::Mjpg => {
@@ -113,7 +154,7 @@ impl Processor {
                 (rgbx, self.decoded.as_slice(), width * 4, start.elapsed())
             }
         };
-        let [a, b, c] = match &mut self.backend {
+        let [a, b, model, c] = match &mut self.backend {
             Backend::Gpu(gpu) => gpu.process(input, src, src_stride, width, height, dst, dst_stride)?,
             Backend::Cpu(cpu) => {
                 let t0 = Instant::now();
@@ -122,15 +163,17 @@ impl Processor {
                     return Err(format!("short frame ({} bytes)", src.len()));
                 }
                 let t1 = Instant::now();
+                let mut model = Duration::ZERO;
                 for effect in &mut cpu.effects {
-                    effect.apply(&mut cpu.planar);
+                    effect.apply(&mut cpu.planar)?;
+                    model += effect.model_time();
                 }
                 let t2 = Instant::now();
                 pipeline::pack_yuy2_bt601(&cpu.planar, dst, dst_stride);
-                [t1 - t0, t2 - t1, t2.elapsed()]
+                [t1 - t0, (t2 - t1).saturating_sub(model), model, t2.elapsed()]
             }
         };
-        Ok([decode, a, b, c])
+        Ok([decode, a, b, model, c])
     }
 
     /// Decode a JPEG frame into `self.decoded` as RGBx, checking it is the
@@ -213,7 +256,11 @@ mod tests {
     }
 
     fn gpu_or_skip() -> Option<Processor> {
-        match Processor::gpu() {
+        gpu_with(Effects::Flip)
+    }
+
+    fn gpu_with(effects: Effects) -> Option<Processor> {
+        match Processor::gpu(effects) {
             Ok(gpu) => Some(gpu),
             Err(e) => {
                 eprintln!("skipping: no GPU ({e})");
@@ -233,7 +280,7 @@ mod tests {
     #[test]
     fn gpu_matches_cpu() {
         let Some(mut gpu) = gpu_or_skip() else { return };
-        let mut cpu = Processor::cpu();
+        let mut cpu = Processor::cpu(Effects::Flip);
         // Odd sizes in workgroup terms, and padded input rows.
         let (w, h) = (70, 37);
         let mut cases: Vec<(&str, FrameFormat, Vec<u8>, usize)> = raw_formats()
@@ -261,7 +308,7 @@ mod tests {
         let (w, h) = (64, 48);
         let px = smooth_rgbx(w, h);
         let mjpg = jpeg(&px, w, h, 100, turbojpeg::Subsamp::None);
-        let mut cpu = Processor::cpu();
+        let mut cpu = Processor::cpu(Effects::Flip);
         let (mut from_raw, mut from_jpeg) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
         let t = cpu.process(FrameFormat::Raw(rgbx()), &px, w * 4, w, h, &mut from_raw, w * 2).unwrap();
         assert_eq!(t[0], Duration::ZERO, "raw frames have no decode stage");
@@ -274,7 +321,7 @@ mod tests {
     fn mjpg_rejects_bad_frames() {
         let (w, h) = (32, 16);
         let mjpg = jpeg(&smooth_rgbx(w, h), w, h, 90, turbojpeg::Subsamp::Sub2x1);
-        let mut cpu = Processor::cpu();
+        let mut cpu = Processor::cpu(Effects::Flip);
         let mut dst = vec![0u8; 64 * 2 * 16];
         let err = cpu.process(FrameFormat::Mjpg, &mjpg, 0, 64, 16, &mut dst, 128).unwrap_err();
         assert!(err.contains("32x16"), "{err}");
@@ -309,7 +356,7 @@ mod tests {
     fn bench_cpu_vs_gpu() {
         const FRAMES: u32 = 100;
         let (w, h) = (1920, 1080);
-        let mut backends = vec![("CPU", Processor::cpu())];
+        let mut backends = vec![("CPU", Processor::cpu(Effects::Flip))];
         backends.extend(gpu_or_skip().map(|g| ("GPU", g)));
         let mut dst = vec![0u8; w * 2 * h];
         let mjpg = bench_jpeg(w, h);
@@ -322,7 +369,7 @@ mod tests {
         for (name, format, src, stride) in &cases {
             for (backend, proc) in &mut backends {
                 proc.process(*format, src, *stride, w, h, &mut dst, w * 2).unwrap(); // warm up
-                let mut stages = [Duration::ZERO; 4];
+                let mut stages = [Duration::ZERO; 5];
                 let start = Instant::now();
                 for _ in 0..FRAMES {
                     let t = proc.process(*format, src, *stride, w, h, &mut dst, w * 2).unwrap();
@@ -344,5 +391,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn green_screen_gpu_matches_cpu() {
+        use crate::model::fake::FakeMatte;
+        let fake = || Effects::GreenScreen(Box::<FakeMatte>::default());
+        let Some(mut gpu) = gpu_with(fake()) else { return };
+        let mut cpu = Processor::cpu(fake());
+        // Not the model's aspect ratio, and not a multiple of the workgroup.
+        for (w, h) in [(200, 120), (70, 37)] {
+            let src = pattern(rgbx(), w, h, w * 4);
+            let (mut a, mut b) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
+            cpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut a, w * 2).unwrap();
+            gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut b, w * 2).unwrap();
+            let diffs: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).collect();
+            let worst = *diffs.iter().max().unwrap();
+            let off = diffs.iter().filter(|&&d| d > 0).count();
+            eprintln!("{w}x{h}: {off} of {} bytes differ, by up to {worst}", a.len());
+            // The model input is f16, which the GPU and CPU may round
+            // differently in the last bit; allow that to show through.
+            assert!(worst <= 2, "{w}x{h}: GPU differs from CPU by up to {worst}");
+            assert!(off * 100 < a.len(), "{w}x{h}: {off} bytes differ");
+        }
+    }
+
+    /// Run the real model on `testimage.jpg` on both backends. Needs the
+    /// split model and the NPU (or `VIDEO_MENU_MODEL_DEVICE`). Set
+    /// `VIDEO_MENU_TEST_OUT` to a directory to save the YUY2 results.
+    ///
+    ///     cargo test --release -- --ignored --nocapture real_model
+    #[test]
+    #[ignore]
+    fn real_model_on_testimage() {
+        use crate::model::RvmMatte;
+        const FRAMES: usize = 8;
+        let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testimage.jpg"))
+            .expect("testimage.jpg");
+        let header = turbojpeg::read_header(&jpg).unwrap();
+        let (w, h) = (header.width, header.height);
+        let matte = || Effects::GreenScreen(Box::new(RvmMatte::from_env().unwrap()));
+        let mut outputs = Vec::new();
+        for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
+            let mut dst = vec![0u8; w * 2 * h];
+            // A still image as a short clip, so the recurrent state settles.
+            let mut last = [Duration::ZERO; 5];
+            for _ in 0..FRAMES {
+                last = proc.process(FrameFormat::Mjpg, &jpg, 0, w, h, &mut dst, w * 2).unwrap();
+            }
+            let stages: Vec<String> = proc
+                .stage_names()
+                .iter()
+                .zip(last)
+                .map(|(n, t)| format!("{n} {:.2}", t.as_secs_f64() * 1e3))
+                .collect();
+            eprintln!("{name}: last frame {}", stages.join(", "));
+            if let Ok(dir) = std::env::var("VIDEO_MENU_TEST_OUT") {
+                std::fs::write(format!("{dir}/green_{name}_{w}x{h}.yuv"), &dst).unwrap();
+            }
+            outputs.push(dst);
+        }
+        let diffs: Vec<u8> = outputs[0].iter().zip(&outputs[1]).map(|(a, b)| a.abs_diff(*b)).collect();
+        let big = diffs.iter().filter(|&&d| d > 8).count();
+        eprintln!(
+            "cpu vs gpu: max diff {}, {} of {} bytes differ by more than 8",
+            diffs.iter().max().unwrap(),
+            big,
+            diffs.len()
+        );
+        // f16 rounding differences in the model input can nudge the matte,
+        // but the results must agree almost everywhere.
+        assert!(big * 1000 < diffs.len(), "CPU and GPU results disagree");
     }
 }
