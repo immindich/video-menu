@@ -16,6 +16,7 @@ mod formats;
 mod gpu;
 mod model;
 mod pipeline;
+mod processor;
 mod relay;
 
 use std::error::Error;
