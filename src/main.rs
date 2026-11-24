@@ -22,6 +22,10 @@
 //! - `VIDEO_MENU_MODEL_DEVICE` is the device the model runs on (default NPU).
 //! - `VIDEO_MENU_NPU_TURBO=1` trades CPU time for slightly lower model
 //!   latency when the camera is slow (see `model.rs`).
+//! - `VIDEO_MENU_REUSE_MATTE=1` composites each frame with the previous
+//!   frame's matte while the model works on the current one, taking the
+//!   model off the path from camera to output. The matte then lags the
+//!   image by a frame.
 
 mod commands;
 mod formats;
@@ -36,7 +40,7 @@ use std::error::Error;
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use model::RvmMatte;
+use model::{Matting, RvmMatte};
 use processor::{Effects, Processor};
 use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, roundtrip};
 
@@ -58,8 +62,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok("flip") => Effects::Flip,
         Ok("green") | Ok("") | Err(_) => {
             let matte = RvmMatte::from_env()?;
+            let reuse = std::env::var("VIDEO_MENU_REUSE_MATTE").as_deref() == Ok("1");
             eprintln!("matting model running on the {}", matte.device());
-            Effects::GreenScreen(Box::new(matte))
+            if reuse {
+                eprintln!("reusing each frame's matte for the next frame");
+            }
+            Effects::GreenScreen(Matting::new(Box::new(matte), reuse))
         }
         Ok(other) => return Err(format!("VIDEO_MENU_EFFECT must be green or flip, not {other:?}").into()),
     };

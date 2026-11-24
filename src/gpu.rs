@@ -18,7 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::{
-    model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matte},
+    model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matting},
     pipeline::{self, GREEN, InputFormat},
 };
 
@@ -28,7 +28,7 @@ const WORKGROUP: u32 = 16;
 pub enum GpuEffect {
     VerticalFlip,
     /// Replace the background with green, using a matting model.
-    GreenScreen(Box<dyn Matte>),
+    GreenScreen(Matting),
 }
 
 #[repr(C)]
@@ -290,7 +290,7 @@ impl GpuProcessor {
                     self.dispatch(&mut encoder, &self.vertical_flip, w, h / 2);
                 }
                 GpuEffect::GreenScreen(matte) => {
-                    result = self.run_model(&mut encoder, matte.as_mut(), &mut times);
+                    result = self.run_model(&mut encoder, matte, &mut times);
                     if result.is_err() {
                         break;
                     }
@@ -332,7 +332,7 @@ impl GpuProcessor {
     fn run_model(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        matte: &mut dyn Matte,
+        matte: &mut Matting,
         times: &mut Times,
     ) -> Result<(), String> {
         let pairs = (MODEL_WIDTH / 2) as u32;
@@ -355,7 +355,7 @@ impl GpuProcessor {
         }
         self.small_readback.unmap();
 
-        let (a, b) = matte.infer(&self.small_host)?;
+        let (a, b) = matte.run(&self.small_host)?;
         let t = Instant::now();
         self.queue.write_buffer(&self.coef, 0, bytemuck::cast_slice(a));
         self.queue.write_buffer(&self.coef, (a.len() * 2) as u64, bytemuck::cast_slice(b));

@@ -6,8 +6,12 @@
 //! returns per-pixel coefficients `A` and `b` (4 channels each: foreground
 //! residual R, G, B and alpha). The caller upsamples them to the frame's
 //! resolution and computes `A * [R, G, B, gray] + b` there; see
-//! [`crate::pipeline::GreenScreen`] and `refine_composite` in
-//! `pipeline.wgsl`.
+//! [`crate::pipeline::GreenScreen`] and `green_screen` in `pipeline.wgsl`.
+//!
+//! [`Matting`] schedules the model. It can either run it on each frame
+//! before that frame is composited, or reuse the previous frame's result
+//! while the model works on the current frame in the background, which takes
+//! the model off the path from camera to output.
 
 use std::time::{Duration, Instant};
 
@@ -27,18 +31,93 @@ const MODEL_FILE: &str = "rvm_mobilenetv3_fp16_core.onnx";
 /// relative to the model resolution (stride-2 convolutions round up).
 const RECURRENT: [(&str, i64, i64); 4] = [("r1", 16, 2), ("r2", 20, 4), ("r3", 40, 8), ("r4", 64, 16)];
 
-/// Something that turns a downsampled frame into refiner coefficients.
+/// Something that turns a downsampled frame into refiner coefficients,
+/// possibly in the background.
 pub trait Matte {
-    /// `src` is the frame at `MODEL_WIDTH`x`MODEL_HEIGHT` as three planes
-    /// (R, G, B) of values in 0..1. Returns `A` and `b`, each four planes
-    /// (fgr residual R, G, B, then alpha) at the same resolution.
-    fn infer(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String>;
+    /// Start working on `src`: the frame at `MODEL_WIDTH`x`MODEL_HEIGHT` as
+    /// three planes (R, G, B) of values in 0..1. At most one frame is in
+    /// flight; call [`finish`](Self::finish) before starting another.
+    fn start(&mut self, src: &[f16]) -> Result<(), String>;
 
-    /// Forget temporal state, e.g. after switching cameras.
+    /// Wait for the started frame and make its result the current
+    /// [`coefficients`](Self::coefficients).
+    fn finish(&mut self) -> Result<(), String>;
+
+    /// The latest finished result: `A` and `b`, each four planes (fgr
+    /// residual R, G, B, then alpha) at the model's resolution. Unaffected by
+    /// [`start`](Self::start), so it can be used while a frame is in flight.
+    fn coefficients(&self) -> (&[f16], &[f16]);
+
+    /// Forget temporal state, e.g. after switching cameras. Must not be
+    /// called while a frame is in flight.
     fn reset(&mut self);
+}
 
-    /// How long the last [`infer`](Self::infer) took.
-    fn last_time(&self) -> Duration;
+/// Runs a [`Matte`] for each frame, either in step with the frames or one
+/// frame behind.
+pub struct Matting {
+    matte: Box<dyn Matte>,
+    /// Composite each frame with the previous frame's result, so the model
+    /// runs alongside the rest of the pipeline instead of before it.
+    reuse: bool,
+    /// A frame is in flight (reuse mode only).
+    pending: bool,
+    /// The matte has a result to reuse.
+    ready: bool,
+    last: Duration,
+}
+
+impl Matting {
+    pub fn new(matte: Box<dyn Matte>, reuse: bool) -> Self {
+        Self { matte, reuse, pending: false, ready: false, last: Duration::ZERO }
+    }
+
+    /// The coefficients to composite the frame whose model input is `src`
+    /// with: that frame's own, or in reuse mode the previous frame's (the
+    /// model then starts on `src` in the background). The first frame after
+    /// a reset always waits for its own result.
+    pub fn run(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String> {
+        let start = Instant::now();
+        if self.pending {
+            self.pending = false;
+            self.matte.finish()?;
+        } else if !self.reuse || !self.ready {
+            self.matte.start(src)?;
+            self.matte.finish()?;
+        }
+        if self.reuse {
+            // The first frame was just run synchronously; running it again
+            // here only gives the recurrent state one more look at it.
+            self.matte.start(src)?;
+            self.pending = true;
+        }
+        self.ready = true;
+        self.last = start.elapsed();
+        Ok(self.matte.coefficients())
+    }
+
+    /// Forget temporal state, e.g. after switching cameras or frame sizes.
+    pub fn reset(&mut self) {
+        if std::mem::take(&mut self.pending) {
+            let _ = self.matte.finish();
+        }
+        self.matte.reset();
+        self.ready = false;
+    }
+
+    /// How long the last [`run`](Self::run) kept the caller waiting.
+    pub fn last_time(&self) -> Duration {
+        self.last
+    }
+}
+
+impl Drop for Matting {
+    fn drop(&mut self) {
+        // Don't free the model's buffers while it may still be using them.
+        if self.pending {
+            let _ = self.matte.finish();
+        }
+    }
 }
 
 /// RVM on OpenVINO.
@@ -50,7 +129,6 @@ pub struct RvmMatte {
     a: Vec<f16>,
     b: Vec<f16>,
     device: String,
-    last: Duration,
 }
 
 impl RvmMatte {
@@ -136,7 +214,6 @@ impl RvmMatte {
             a: vec![f16::ZERO; 4 * MODEL_PIXELS],
             b: vec![f16::ZERO; 4 * MODEL_PIXELS],
             device: device.into(),
-            last: Duration::ZERO,
         })
     }
 
@@ -144,7 +221,7 @@ impl RvmMatte {
         &self.device
     }
 
-    fn run(&mut self, src: &[f16]) -> Result<(), openvino::InferenceError> {
+    fn start_inner(&mut self, src: &[f16]) -> Result<(), openvino::InferenceError> {
         self.src
             .get_raw_data_mut()?
             .copy_from_slice(bytemuck::cast_slice(src));
@@ -152,7 +229,13 @@ impl RvmMatte {
         for ((name, _, _), state) in RECURRENT.iter().zip(&self.state) {
             self.request.set_tensor(&format!("{name}i"), state)?;
         }
-        self.request.infer()?;
+        self.request.infer_async()
+    }
+
+    fn finish_inner(&mut self) -> Result<(), openvino::InferenceError> {
+        // The C API doesn't report a timeout; this one only guards against a
+        // hung device.
+        self.request.wait(10_000)?;
         let copy_out = |name: &str, dst: &mut [f16]| -> Result<(), openvino::InferenceError> {
             let t = self.request.get_tensor(name)?;
             bytemuck::cast_slice_mut(dst).copy_from_slice(t.get_raw_data()?);
@@ -171,14 +254,19 @@ impl RvmMatte {
 }
 
 impl Matte for RvmMatte {
-    fn infer(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String> {
+    fn start(&mut self, src: &[f16]) -> Result<(), String> {
         if src.len() != 3 * MODEL_PIXELS {
             return Err(format!("model input has {} values, expected {}", src.len(), 3 * MODEL_PIXELS));
         }
-        let start = Instant::now();
-        self.run(src).map_err(|e| format!("inference failed: {e}"))?;
-        self.last = start.elapsed();
-        Ok((&self.a, &self.b))
+        self.start_inner(src).map_err(|e| format!("starting inference: {e}"))
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.finish_inner().map_err(|e| format!("inference failed: {e}"))
+    }
+
+    fn coefficients(&self) -> (&[f16], &[f16]) {
+        (&self.a, &self.b)
     }
 
     fn reset(&mut self) {
@@ -187,10 +275,6 @@ impl Matte for RvmMatte {
                 data.fill(0);
             }
         }
-    }
-
-    fn last_time(&self) -> Duration {
-        self.last
     }
 }
 
@@ -238,35 +322,86 @@ pub mod fake {
     pub struct FakeMatte {
         a: Vec<f16>,
         b: Vec<f16>,
+        /// The started frame's result, published by `finish`.
+        next: Option<(Vec<f16>, Vec<f16>)>,
         pub frames: usize,
     }
 
-    impl Matte for FakeMatte {
-        fn infer(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String> {
-            let n = MODEL_PIXELS;
-            assert_eq!(src.len(), 3 * n);
-            self.a.resize(4 * n, f16::ZERO);
-            self.b.resize(4 * n, f16::ZERO);
-            for i in 0..n {
-                let rgb = [src[i].to_f32(), src[n + i].to_f32(), src[2 * n + i].to_f32()];
-                for c in 0..4 {
-                    // Residuals in -0.2..0.2; alpha (c = 3) spanning 0..1.
-                    let (a, b) = match c {
-                        3 => (2.0 * rgb[0] - rgb[2], 0.5 * rgb[1] - 0.3),
-                        _ => (0.2 * rgb[(c + 1) % 3] - 0.1, 0.1 - 0.2 * rgb[c]),
-                    };
-                    self.a[c * n + i] = f16::from_f32(a);
-                    self.b[c * n + i] = f16::from_f32(b);
-                }
+    /// The fake's coefficients for one frame.
+    pub fn coefficients_for(src: &[f16]) -> (Vec<f16>, Vec<f16>) {
+        let n = MODEL_PIXELS;
+        assert_eq!(src.len(), 3 * n);
+        let (mut a, mut b) = (vec![f16::ZERO; 4 * n], vec![f16::ZERO; 4 * n]);
+        for i in 0..n {
+            let rgb = [src[i].to_f32(), src[n + i].to_f32(), src[2 * n + i].to_f32()];
+            for c in 0..4 {
+                // Residuals in -0.2..0.2; alpha (c = 3) spanning 0..1.
+                let (ac, bc) = match c {
+                    3 => (2.0 * rgb[0] - rgb[2], 0.5 * rgb[1] - 0.3),
+                    _ => (0.2 * rgb[(c + 1) % 3] - 0.1, 0.1 - 0.2 * rgb[c]),
+                };
+                a[c * n + i] = f16::from_f32(ac);
+                b[c * n + i] = f16::from_f32(bc);
             }
+        }
+        (a, b)
+    }
+
+    impl Matte for FakeMatte {
+        fn start(&mut self, src: &[f16]) -> Result<(), String> {
+            assert!(self.next.is_none(), "started a frame while one was in flight");
+            self.next = Some(coefficients_for(src));
             self.frames += 1;
-            Ok((&self.a, &self.b))
+            Ok(())
         }
 
-        fn reset(&mut self) {}
-
-        fn last_time(&self) -> Duration {
-            Duration::ZERO
+        fn finish(&mut self) -> Result<(), String> {
+            (self.a, self.b) = self.next.take().expect("finished without starting");
+            Ok(())
         }
+
+        fn coefficients(&self) -> (&[f16], &[f16]) {
+            (&self.a, &self.b)
+        }
+
+        fn reset(&mut self) {
+            assert!(self.next.is_none(), "reset while a frame was in flight");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{FakeMatte, coefficients_for};
+    use super::*;
+
+    fn frame(v: f32) -> Vec<f16> {
+        vec![f16::from_f32(v); 3 * MODEL_PIXELS]
+    }
+
+    fn a_of(m: &mut Matting, src: &[f16]) -> Vec<f16> {
+        m.run(src).unwrap().0.to_vec()
+    }
+
+    #[test]
+    fn in_step_uses_each_frames_own_result() {
+        let mut m = Matting::new(Box::<FakeMatte>::default(), false);
+        for v in [0.1, 0.5, 0.9] {
+            assert_eq!(a_of(&mut m, &frame(v)), coefficients_for(&frame(v)).0);
+        }
+    }
+
+    #[test]
+    fn reuse_lags_one_frame_after_the_first() {
+        let mut m = Matting::new(Box::<FakeMatte>::default(), true);
+        let (f1, f2, f3) = (frame(0.1), frame(0.5), frame(0.9));
+        // The first frame has nothing to reuse, so it waits for its own.
+        assert_eq!(a_of(&mut m, &f1), coefficients_for(&f1).0);
+        // Later frames get the previous frame's result.
+        assert_eq!(a_of(&mut m, &f2), coefficients_for(&f1).0);
+        assert_eq!(a_of(&mut m, &f3), coefficients_for(&f2).0);
+        // A reset drops the in-flight frame and starts over.
+        m.reset();
+        assert_eq!(a_of(&mut m, &f1), coefficients_for(&f1).0);
     }
 }

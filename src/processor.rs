@@ -12,7 +12,7 @@ use pipewire::spa::param::video::VideoFormat;
 
 use crate::{
     gpu::{GpuEffect, GpuProcessor},
-    model::Matte,
+    model::Matting,
     pipeline::{self, Effect, GreenScreen, InputFormat, PlanarFrame, VerticalFlip},
 };
 
@@ -21,7 +21,7 @@ pub enum Effects {
     /// Flip upside down; a cheap stand-in for testing.
     Flip,
     /// Replace the background with green using a matting model.
-    GreenScreen(Box<dyn Matte>),
+    GreenScreen(Matting),
 }
 
 impl Effects {
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn green_screen_gpu_matches_cpu() {
         use crate::model::fake::FakeMatte;
-        let fake = || Effects::GreenScreen(Box::<FakeMatte>::default());
+        let fake = || Effects::GreenScreen(Matting::new(Box::<FakeMatte>::default(), false));
         let Some(mut gpu) = gpu_with(fake()) else { return };
         let mut cpu = Processor::cpu(fake());
         // Not the model's aspect ratio, and not a multiple of the workgroup.
@@ -430,7 +430,7 @@ mod tests {
             .expect("testimage.jpg");
         let header = turbojpeg::read_header(&jpg).unwrap();
         let (w, h) = (header.width, header.height);
-        let matte = || Effects::GreenScreen(Box::new(RvmMatte::from_env().unwrap()));
+        let matte = || Effects::GreenScreen(Matting::new(Box::new(RvmMatte::from_env().unwrap()), false));
         let mut outputs = Vec::new();
         for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
             let mut dst = vec![0u8; w * 2 * h];

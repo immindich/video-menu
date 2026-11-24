@@ -6,7 +6,7 @@ use std::time::Duration;
 use half::{f16, slice::HalfFloatSliceExt};
 use pipewire::spa::param::video::VideoFormat;
 
-use crate::model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matte};
+use crate::model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matting};
 
 /// A frame as three planes (R, G, B) of `f32` samples in `0..=1`.
 #[derive(Default)]
@@ -245,7 +245,7 @@ fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usize, dh: usi
 /// resolution, where `A * [R, G, B, gray] + b` gives the foreground colour
 /// (as a residual on the frame) and alpha. This is RVM's own refiner step.
 pub struct GreenScreen {
-    matte: Box<dyn Matte>,
+    matte: Matting,
     background: [f32; 3],
     /// Size of the last frame; the model's temporal state is reset when it
     /// changes.
@@ -257,7 +257,7 @@ pub struct GreenScreen {
 }
 
 impl GreenScreen {
-    pub fn new(matte: Box<dyn Matte>) -> Self {
+    pub fn new(matte: Matting) -> Self {
         Self {
             matte,
             background: GREEN,
@@ -279,7 +279,7 @@ impl Effect for GreenScreen {
         }
         resample(&frame.data, w, h, &mut self.small, MODEL_WIDTH, MODEL_HEIGHT, 3);
         self.small16.convert_from_f32_slice(&self.small);
-        let (a, b) = self.matte.infer(&self.small16)?;
+        let (a, b) = self.matte.run(&self.small16)?;
         let n = 4 * MODEL_PIXELS;
         a.convert_to_f32_slice(&mut self.coef[..n]);
         b.convert_to_f32_slice(&mut self.coef[n..]);
@@ -417,7 +417,7 @@ mod tests {
             .map(|i| [(i % w) as f32 / w as f32, (i / w) as f32 / h as f32, 0.5])
             .collect();
         let mut frame = frame_from(w, h, &rows);
-        let mut effect = GreenScreen::new(Box::<FakeMatte>::default());
+        let mut effect = GreenScreen::new(Matting::new(Box::<FakeMatte>::default(), false));
         effect.apply(&mut frame).unwrap();
         // Every output pixel lies between the (clamped) foreground and green.
         for (k, plane) in frame.planes().iter().enumerate() {
