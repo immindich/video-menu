@@ -25,11 +25,26 @@
           install -Dm755 usr/lib/x86_64-linux-gnu/libnpu_driver_compiler.so -t $out/lib
         '';
       };
+      # RVM's ONNX export, and the split model the daemon runs: the network
+      # without its full-resolution refiner step (see tools/split_refiner.py).
+      rvm-onnx = pkgs.fetchurl {
+        url = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp16.onnx";
+        hash = "sha256-ag1c5swXcCYTvlSFWYebRSHtQkz+FN3EjRrKpE1hb2Q=";
+      };
+      rvm-model = pkgs.runCommand "rvm-mobilenetv3-fp16-core" {
+        nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.onnx ])) ];
+      } ''
+        mkdir -p $out
+        python ${./tools/split_refiner.py} ${rvm-onnx} $out/rvm_mobilenetv3_fp16_core.onnx
+      '';
+
       pythonEnv = pkgs.python3.withPackages (ps: with ps; [
         ps.openvino
         ps.onnx
       ]);
     in {
+      packages.x86_64-linux.rvm-model = rvm-model;
+
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = with pkgs; [
           cargo
@@ -52,6 +67,7 @@
         ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
+        VIDEO_MENU_MODEL = "${rvm-model}/rvm_mobilenetv3_fp16_core.onnx";
         LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
       };
     };
