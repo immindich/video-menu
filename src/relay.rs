@@ -1,7 +1,8 @@
 //! Relay that mirrors a real camera onto a virtual PipeWire camera node.
 //!
 //! Capture and output negotiate formats independently: the camera delivers
-//! whatever supported format it prefers, each frame is unpacked to planar RGB
+//! whatever supported format it prefers (decoding MJPG if it must), each
+//! frame is unpacked to planar RGB
 //! (see [`crate::pipeline`]), run through the effects, and packed as YUY2
 //! by a [`Processor`] on the GPU or CPU
 //! (BT.601, limited range) for applications.
@@ -39,8 +40,9 @@ use spa::{
 
 use crate::{
     formats::{self, CameraMode, serialize},
+    formats::CaptureFormat,
     pipeline::InputFormat,
-    processor::Processor,
+    processor::{FrameFormat, Processor},
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -58,7 +60,7 @@ struct State {
     /// Row stride of frames we produce.
     stride: usize,
     /// Format the camera is delivering, once capture has negotiated.
-    input: Option<(InputFormat, VideoInfoRaw)>,
+    input: Option<FrameFormat>,
     /// Most recent processed frame as YUY2, ready to hand to the consumer.
     frame: Vec<u8>,
     /// Presentation timestamp (ns, CLOCK_MONOTONIC) of `frame`.
@@ -74,12 +76,12 @@ struct State {
 #[derive(Default)]
 struct Timing {
     frames: u32,
-    stages: [Duration; 3],
+    stages: [Duration; 4],
     since: Option<Instant>,
 }
 
 impl Timing {
-    fn record(&mut self, stages: [Duration; 3], names: [&str; 3]) {
+    fn record(&mut self, stages: [Duration; 4], names: [&str; 4]) {
         self.frames += 1;
         for (total, t) in self.stages.iter_mut().zip(stages) {
             *total += t;
@@ -88,16 +90,18 @@ impl Timing {
         if since.elapsed() >= TIMING_INTERVAL {
             let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames as f64;
             let total: Duration = self.stages.iter().sum();
+            // Skip stages that took no time at all (decode, for raw frames).
+            let stages: Vec<String> = names
+                .iter()
+                .zip(self.stages)
+                .filter(|(_, t)| !t.is_zero())
+                .map(|(n, t)| format!("{n} {:.2}", ms(t)))
+                .collect();
             eprintln!(
-                "pipeline: {} frames, {:.2} ms/frame ({} {:.2}, {} {:.2}, {} {:.2})",
+                "pipeline: {} frames, {:.2} ms/frame ({})",
                 self.frames,
                 ms(total),
-                names[0],
-                ms(self.stages[0]),
-                names[1],
-                ms(self.stages[1]),
-                names[2],
-                ms(self.stages[2]),
+                stages.join(", ")
             );
             *self = Self { since: Some(Instant::now()), ..Self::default() };
         }
@@ -308,20 +312,36 @@ impl CameraRelay {
 
     /// The camera settled on a format: remember how to unpack it.
     fn on_input_format(&self, param: &Pod) {
-        let mut info = VideoInfoRaw::new();
-        if info.parse(param).is_err() {
-            return;
-        }
-        let (fmt, size) = (info.format(), info.size());
-        eprintln!("capture: camera format {fmt:?} {}x{}", size.width, size.height);
         let mut st = self.state.borrow_mut();
         st.input = None;
-        let Some(input) = InputFormat::from_video_format(fmt) else {
-            eprintln!("capture: cannot unpack {fmt:?}");
+        let Some((capture, width, height)) = formats::negotiated(param) else {
+            eprintln!("capture: camera chose a format we cannot capture");
             return;
         };
+        eprintln!("capture: camera format {capture:?} {width}x{height}");
+        let input = match capture {
+            CaptureFormat::Mjpg => FrameFormat::Mjpg,
+            CaptureFormat::Raw(fmt) => {
+                let Some(input) = InputFormat::from_video_format(fmt) else {
+                    eprintln!("capture: cannot unpack {fmt:?}");
+                    return;
+                };
+                let mut info = VideoInfoRaw::new();
+                let matrix = match info.parse(param) {
+                    Ok(_) => info.color_matrix(),
+                    Err(_) => spa::sys::SPA_VIDEO_COLOR_MATRIX_UNKNOWN,
+                };
+                if input == InputFormat::Yuy2
+                    && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_UNKNOWN
+                    && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601
+                {
+                    eprintln!("capture: camera uses color matrix {matrix}; decoding as BT.601");
+                }
+                FrameFormat::Raw(input)
+            }
+        };
         if let Some(out) = st.format
-            && out.size() != size
+            && (out.size().width, out.size().height) != (width, height)
         {
             eprintln!(
                 "capture: camera size does not match consumer's {}x{}",
@@ -330,17 +350,10 @@ impl CameraRelay {
             );
             return;
         }
-        let matrix = info.color_matrix();
-        if input == InputFormat::Yuy2
-            && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_UNKNOWN
-            && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601
-        {
-            eprintln!("capture: camera uses color matrix {matrix}; decoding as BT.601");
-        }
-        st.input = Some((input, info));
+        st.input = Some(input);
     }
 
-    /// A camera frame arrived: unpack it to planar RGB, apply the effects,
+    /// A camera frame arrived: decode or unpack it to planar RGB, apply the effects,
     /// pack it into `state.frame` as YUY2, then drive the virtual camera's
     /// graph so the consumer gets it.
     fn on_input_frame(&self) {
@@ -367,14 +380,14 @@ impl CameraRelay {
 
         {
             let st = &mut *self.state.borrow_mut();
-            let (Some(format), Some((input, _))) = (st.format, st.input) else {
+            let (Some(format), Some(input)) = (st.format, st.input) else {
                 return;
             };
             let (width, height) = (format.size().width as usize, format.size().height as usize);
-            let src_stride = if src_stride > 0 {
-                src_stride as usize
-            } else {
-                input.row_bytes(width)
+            let src_stride = match input {
+                _ if src_stride > 0 => src_stride as usize,
+                FrameFormat::Raw(raw) => raw.row_bytes(width),
+                FrameFormat::Mjpg => 0,
             };
 
             st.frame.resize(st.stride * height, 0);
@@ -755,7 +768,7 @@ impl VideoSources {
                                 let Some(param) = param else { return };
                                 let is_video = matches!(
                                     spa::param::format_utils::parse_format(param),
-                                    Ok((MediaType::Video, MediaSubtype::Raw))
+                                    Ok((MediaType::Video, MediaSubtype::Raw | MediaSubtype::Mjpg))
                                 );
                                 if id == ParamType::EnumFormat && is_video {
                                     formats.borrow_mut().push(param.as_bytes().to_vec());
