@@ -6,7 +6,7 @@ use std::time::Duration;
 use half::{f16, slice::HalfFloatSliceExt};
 use pipewire::spa::param::video::VideoFormat;
 
-use crate::model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matting};
+use crate::model::Matting;
 
 /// A frame as three planes (R, G, B) of `f32` samples in `0..=1`.
 #[derive(Default)]
@@ -258,13 +258,14 @@ pub struct GreenScreen {
 
 impl GreenScreen {
     pub fn new(matte: Matting) -> Self {
+        let (mw, mh) = matte.size();
         Self {
             matte,
             background: GREEN,
             size: (0, 0),
-            small: vec![0.0; 3 * MODEL_PIXELS],
-            small16: vec![f16::ZERO; 3 * MODEL_PIXELS],
-            coef: vec![0.0; 8 * MODEL_PIXELS],
+            small: vec![0.0; 3 * mw * mh],
+            small16: vec![f16::ZERO; 3 * mw * mh],
+            coef: vec![0.0; 8 * mw * mh],
             coef_full: Vec::new(),
         }
     }
@@ -277,17 +278,18 @@ impl Effect for GreenScreen {
             self.matte.reset();
             self.size = (w, h);
         }
-        resample(&frame.data, w, h, &mut self.small, MODEL_WIDTH, MODEL_HEIGHT, 3);
+        let (mw, mh) = self.matte.size();
+        resample(&frame.data, w, h, &mut self.small, mw, mh, 3);
         self.small16.convert_from_f32_slice(&self.small);
         let (a, b) = self.matte.run(&self.small16)?;
-        let n = 4 * MODEL_PIXELS;
+        let n = 4 * mw * mh;
         a.convert_to_f32_slice(&mut self.coef[..n]);
         b.convert_to_f32_slice(&mut self.coef[n..]);
 
         // Upsample all 8 coefficient planes (A then b) to the frame size.
         let pixels = w * h;
         self.coef_full.resize(8 * pixels, 0.0);
-        resample(&self.coef, MODEL_WIDTH, MODEL_HEIGHT, &mut self.coef_full, w, h, 8);
+        resample(&self.coef, mw, mh, &mut self.coef_full, w, h, 8);
 
         let bg = self.background;
         let [rp, gp, bp] = frame.planes_mut();

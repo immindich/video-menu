@@ -40,7 +40,7 @@ use std::error::Error;
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use model::{Matting, RvmMatte};
+use model::Matting;
 use processor::{Effects, Processor};
 use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, roundtrip};
 
@@ -61,13 +61,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let effects = match std::env::var("VIDEO_MENU_EFFECT").as_deref() {
         Ok("flip") => Effects::Flip,
         Ok("green") | Ok("") | Err(_) => {
-            let matte = RvmMatte::from_env()?;
+            let (matte, description) = model::from_env()?;
             let reuse = std::env::var("VIDEO_MENU_REUSE_MATTE").as_deref() == Ok("1");
-            eprintln!("matting model running on the {}", matte.device());
+            eprintln!("matting with {description}");
             if reuse {
                 eprintln!("reusing each frame's matte for the next frame");
             }
-            Effects::GreenScreen(Matting::new(Box::new(matte), reuse))
+            Effects::GreenScreen(Matting::new(matte, reuse))
         }
         Ok(other) => return Err(format!("VIDEO_MENU_EFFECT must be green or flip, not {other:?}").into()),
     };

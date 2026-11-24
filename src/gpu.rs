@@ -18,7 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::{
-    model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matting},
+    model::Matting,
     pipeline::{self, GREEN, InputFormat},
 };
 
@@ -82,6 +82,8 @@ pub struct GpuProcessor {
     staging: Vec<u8>,
     /// The model input, copied out of `small_readback`.
     small_host: Vec<f16>,
+    /// Resolution of the matting model, which sizes `small` and `coef`.
+    model_size: (usize, usize),
     adapter_name: String,
 }
 
@@ -173,7 +175,9 @@ impl GpuProcessor {
             })
         };
         use wgpu::BufferUsages as U;
-        let small_bytes = (3 * MODEL_PIXELS * 2) as u64;
+        // Placeholders until set_effects knows the model's resolution.
+        let model_size = (2, 1);
+        let (small, small_readback, coef) = model_buffers(&device, model_size);
 
         Ok(Self {
             unpack_packed: pipeline("unpack_packed"),
@@ -183,9 +187,9 @@ impl GpuProcessor {
             green_screen: pipeline("green_screen"),
             pack_yuy2: pipeline("pack_yuy2"),
             params: buffer("params", size_of::<Params>() as u64, U::UNIFORM | U::COPY_DST),
-            small: buffer("small", small_bytes, U::STORAGE | U::COPY_SRC),
-            small_readback: buffer("small readback", small_bytes, U::MAP_READ | U::COPY_DST),
-            coef: buffer("coef", (8 * MODEL_PIXELS * 2) as u64, U::STORAGE | U::COPY_DST),
+            small,
+            small_readback,
+            coef,
             device,
             queue,
             layout,
@@ -193,12 +197,26 @@ impl GpuProcessor {
             frame: None,
             last_size: (0, 0),
             staging: Vec::new(),
-            small_host: vec![f16::ZERO; 3 * MODEL_PIXELS],
+            small_host: Vec::new(),
+            model_size,
             adapter_name: info.name,
         })
     }
 
     pub fn set_effects(&mut self, effects: Vec<GpuEffect>) {
+        let model_size = effects.iter().find_map(|e| match e {
+            GpuEffect::GreenScreen(matte) => Some(matte.size()),
+            GpuEffect::VerticalFlip => None,
+        });
+        if let Some(size) = model_size
+            && size != self.model_size
+        {
+            (self.small, self.small_readback, self.coef) = model_buffers(&self.device, size);
+            self.small_host = vec![f16::ZERO; 3 * size.0 * size.1];
+            self.model_size = size;
+            // The bind group refers to the old buffers.
+            self.frame = None;
+        }
         self.effects = effects;
         self.last_size = (0, 0);
     }
@@ -266,8 +284,8 @@ impl GpuProcessor {
             g_shift: 8 * g as u32,
             b_shift: 8 * b as u32,
             _pad0: 0,
-            small_w: MODEL_WIDTH as u32,
-            small_h: MODEL_HEIGHT as u32,
+            small_w: self.model_size.0 as u32,
+            small_h: self.model_size.1 as u32,
             _pad1: [0; 2],
             bg: [GREEN[0], GREEN[1], GREEN[2], 1.0],
         };
@@ -335,8 +353,8 @@ impl GpuProcessor {
         matte: &mut Matting,
         times: &mut Times,
     ) -> Result<(), String> {
-        let pairs = (MODEL_WIDTH / 2) as u32;
-        self.dispatch(encoder, &self.downsample, pairs, MODEL_HEIGHT as u32);
+        let (mw, mh) = self.model_size;
+        self.dispatch(encoder, &self.downsample, (mw / 2) as u32, mh as u32);
         let bytes = self.small.size();
         encoder.copy_buffer_to_buffer(&self.small, 0, &self.small_readback, 0, bytes);
         let fresh = self.device.create_command_encoder(&Default::default());
@@ -426,4 +444,22 @@ impl GpuProcessor {
         });
         self.frame = Some(Frame { width, height, input, output, readback, bind_group });
     }
+}
+
+/// Buffers for a matting model working at `(w, h)`: the frame at that
+/// resolution (f16, written by `downsample`), its CPU readback copy, and the
+/// model's coefficients (f16 A then b, read by `green_screen`). The shaders
+/// pack two f16 per word, so `w` must be even.
+fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    assert!(w.is_multiple_of(2), "model width must be even");
+    let buffer = |label, size, usage| {
+        device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+    };
+    use wgpu::BufferUsages as U;
+    let small_bytes = (3 * w * h * 2) as u64;
+    (
+        buffer("small", small_bytes, U::STORAGE | U::COPY_SRC),
+        buffer("small readback", small_bytes, U::MAP_READ | U::COPY_DST),
+        buffer("coef", (8 * w * h * 2) as u64, U::STORAGE | U::COPY_DST),
+    )
 }

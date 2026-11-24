@@ -396,9 +396,15 @@ mod tests {
     #[test]
     fn green_screen_gpu_matches_cpu() {
         use crate::model::fake::FakeMatte;
-        let fake = || Effects::GreenScreen(Matting::new(Box::<FakeMatte>::default(), false));
-        let Some(mut gpu) = gpu_with(fake()) else { return };
-        let mut cpu = Processor::cpu(fake());
+        // RVM's and MODNet's model resolutions.
+        for (mw, mh) in [(480, 270), (512, 288)] {
+            let fake = || Effects::GreenScreen(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false));
+            let Some(gpu) = gpu_with(fake()) else { return };
+            green_screen_matches(gpu, Processor::cpu(fake()), (mw, mh));
+        }
+    }
+
+    fn green_screen_matches(mut gpu: Processor, mut cpu: Processor, (mw, mh): (usize, usize)) {
         // Not the model's aspect ratio, and not a multiple of the workgroup.
         for (w, h) in [(200, 120), (70, 37)] {
             let src = pattern(rgbx(), w, h, w * 4);
@@ -408,7 +414,7 @@ mod tests {
             let diffs: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).collect();
             let worst = *diffs.iter().max().unwrap();
             let off = diffs.iter().filter(|&&d| d > 0).count();
-            eprintln!("{w}x{h}: {off} of {} bytes differ, by up to {worst}", a.len());
+            eprintln!("model {mw}x{mh}, frame {w}x{h}: {off} of {} bytes differ, by up to {worst}", a.len());
             // The model input is f16, which the GPU and CPU may round
             // differently in the last bit; allow that to show through.
             assert!(worst <= 2, "{w}x{h}: GPU differs from CPU by up to {worst}");
@@ -416,21 +422,21 @@ mod tests {
         }
     }
 
-    /// Run the real model on `testimage.jpg` on both backends. Needs the
-    /// split model and the NPU (or `VIDEO_MENU_MODEL_DEVICE`). Set
+    /// Run the real model (chosen as in the daemon, with
+    /// `VIDEO_MENU_MATTE_MODEL`) on `testimage.jpg` on both backends. Needs
+    /// the model files and the NPU (or `VIDEO_MENU_MODEL_DEVICE`). Set
     /// `VIDEO_MENU_TEST_OUT` to a directory to save the YUY2 results.
     ///
     ///     cargo test --release -- --ignored --nocapture real_model
     #[test]
     #[ignore]
     fn real_model_on_testimage() {
-        use crate::model::RvmMatte;
         const FRAMES: usize = 8;
         let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testimage.jpg"))
             .expect("testimage.jpg");
         let header = turbojpeg::read_header(&jpg).unwrap();
         let (w, h) = (header.width, header.height);
-        let matte = || Effects::GreenScreen(Matting::new(Box::new(RvmMatte::from_env().unwrap()), false));
+        let matte = || Effects::GreenScreen(Matting::new(crate::model::from_env().unwrap().0, false));
         let mut outputs = Vec::new();
         for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
             let mut dst = vec![0u8; w * 2 * h];
