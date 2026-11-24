@@ -80,12 +80,18 @@ impl InputFormat {
     }
 }
 
+/// Whether `len` bytes with rows `stride` apart hold a `width`x`height` frame.
+pub fn frame_fits(format: InputFormat, len: usize, stride: usize, width: usize, height: usize) -> bool {
+    let row_bytes = format.row_bytes(width);
+    height > 0 && stride >= row_bytes && len >= (height - 1) * stride + row_bytes
+}
+
 /// Unpack a camera frame of `frame`'s size into `frame`. Returns false if
 /// `src` is too short to hold it.
 pub fn unpack(format: InputFormat, src: &[u8], stride: usize, frame: &mut PlanarFrame) -> bool {
     let (width, height) = (frame.width, frame.height);
     let row_bytes = format.row_bytes(width);
-    if height == 0 || stride < row_bytes || src.len() < (height - 1) * stride + row_bytes {
+    if !frame_fits(format, src.len(), stride, width, height) {
         return false;
     }
     let [rp, gp, bp] = frame.planes_mut();
