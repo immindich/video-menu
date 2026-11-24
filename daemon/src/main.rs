@@ -9,8 +9,12 @@
 //!
 //! Usage: `video-menu [CAMERA_NODE_NAME]`. Without an argument, the first
 //! camera found in the graph is used; if there is none, the daemon starts
-//! with no camera selected. When run in a terminal, cameras can be switched
-//! with commands on stdin (see [`commands`]).
+//! with no camera selected.
+//!
+//! The daemon is controlled over D-Bus (see [`dbus`] and the
+//! `video-menu-protocol` crate): it owns `io.github.immindich.VideoMenu` on
+//! the session bus, so only one can run at a time. The environment variables
+//! below set its starting settings.
 //!
 //! Frames are processed on the GPU (Vulkan via wgpu) when one is available,
 //! otherwise on the CPU; set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force one.
@@ -34,7 +38,7 @@
 //!   model off the path from camera to output. The matte then lags the
 //!   image by a frame.
 
-mod commands;
+mod dbus;
 mod formats;
 mod gpu;
 mod model;
@@ -42,7 +46,7 @@ mod pipeline;
 mod processor;
 mod relay;
 
-use std::error::Error;
+use std::{error::Error, rc::Rc};
 
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
@@ -52,6 +56,22 @@ use relay::{CameraRelay, OUTPUT_NODE_NAME, Settings, VideoSources, roundtrip};
 
 fn main() -> Result<(), Box<dyn Error>> {
     pw::init();
+
+    // Claim the bus name first, so a second daemon stops before it loads a
+    // model or opens a camera. Requests wait in the channel until the relay
+    // exists.
+    let settings = Settings::from_env()?;
+    let (calls, calls_rx) = pw::channel::channel::<dbus::Call>();
+    let service = dbus::start(
+        calls,
+        dbus::Snapshot {
+            model: settings.model,
+            effect: settings.effect,
+            reuse_matte: settings.reuse_matte,
+            selfie_smoothing: settings.selfie_smoothing as f64,
+            ..Default::default()
+        },
+    )?;
 
     let target = std::env::args().nth(1);
 
@@ -64,7 +84,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     roundtrip(&mainloop, &core)?; // their formats
     let initial = sources.select(target.as_deref())?;
 
-    let settings = Settings::from_env()?;
     let (effects, description) = Effects::load(
         settings.effect,
         settings.model,
@@ -81,9 +100,60 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => eprintln!("no camera found; starting unconnected"),
     }
     relay.publish()?;
-    let _commands = commands::attach(&mainloop, relay.clone());
+
+    let service = Rc::new(service);
+    service.refresh(snapshot(&relay));
+    let _calls = calls_rx.attach(mainloop.loop_(), {
+        let (relay, service) = (relay.clone(), service.clone());
+        move |call: dbus::Call| {
+            let result = handle(&relay, &call.request);
+            if let Err(e) = &result {
+                eprintln!("dbus: {:?} failed: {e}", call.request);
+            }
+            service.refresh(snapshot(&relay));
+            call.reply(result);
+        }
+    });
+    // Sources come and go and statistics change on their own; publish them.
+    let refresh = mainloop.loop_().add_timer({
+        let relay = relay.clone();
+        move |_| service.refresh(snapshot(&relay))
+    });
+    let second = Some(std::time::Duration::from_secs(1));
+    refresh.update_timer(second, second).into_sync_result()?;
 
     eprintln!("virtual camera {OUTPUT_NODE_NAME} ready");
     mainloop.run();
     Ok(())
+}
+
+/// What D-Bus clients should see of the relay right now.
+fn snapshot(relay: &CameraRelay) -> dbus::Snapshot {
+    let settings = relay.settings();
+    dbus::Snapshot {
+        camera: relay.camera().unwrap_or_default(),
+        sources: relay.sources().list(),
+        model: settings.model,
+        effect: settings.effect,
+        reuse_matte: settings.reuse_matte,
+        selfie_smoothing: settings.selfie_smoothing as f64,
+        stats: relay.stats(),
+    }
+}
+
+/// Carry out a D-Bus client's request on the relay.
+fn handle(relay: &CameraRelay, request: &dbus::Request) -> Result<(), String> {
+    use dbus::Request::*;
+    match request {
+        Camera(name) => relay
+            .set_camera(Some(name.as_str()).filter(|n| !n.is_empty()))
+            .map_err(|e| e.to_string()),
+        Model(model) => relay.set_model(*model),
+        Effect(effect) => relay.set_effect(*effect),
+        ReuseMatte(reuse) => {
+            relay.set_reuse_matte(*reuse);
+            Ok(())
+        }
+        SelfieSmoothing(strength) => relay.set_selfie_smoothing(*strength),
+    }
 }

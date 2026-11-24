@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel = "2.5.0"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
 openvino = "0.11.1"
@@ -12,3 +13,4 @@ pollster = "1.0.3"
 turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config"] }
 video-menu-protocol = { version = "0.1.0", path = "../protocol" }
 wgpu = "30.0.2"
+zbus = "6.5.0"

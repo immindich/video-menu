@@ -38,7 +38,7 @@ use spa::{
     utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, SpaTypes, result::SpaResult},
 };
 
-use video_menu_protocol::{EffectChoice, ModelChoice};
+use video_menu_protocol::{EffectChoice, ModelChoice, Stats};
 
 use crate::{
     formats::{self, CameraMode, CaptureFormat, serialize},
@@ -49,6 +49,9 @@ use crate::{
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
 const OUTPUT_DESCRIPTION: &str = "Video Menu Camera";
 const INPUT_NODE_NAME: &str = "video-menu.capture";
+
+/// How often statistics for clients are updated.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often per-stage frame timings are logged.
 const TIMING_INTERVAL: Duration = Duration::from_secs(5);
@@ -73,41 +76,86 @@ struct State {
     timing: Timing,
 }
 
-/// Accumulates per-stage processing times and logs their averages.
+/// Per-stage processing times accumulated over a period.
 #[derive(Default)]
-struct Timing {
+struct Window {
     frames: u32,
-    /// Camera frames dropped because processing fell behind.
-    skipped: u32,
     stages: [Duration; 5],
     since: Option<Instant>,
 }
 
-impl Timing {
-    fn record(&mut self, stages: [Duration; 5], names: [&str; 5]) {
+impl Window {
+    fn add(&mut self, stages: [Duration; 5]) {
+        self.since.get_or_insert_with(Instant::now);
         self.frames += 1;
         for (total, t) in self.stages.iter_mut().zip(stages) {
             *total += t;
         }
-        let since = *self.since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= TIMING_INTERVAL {
-            let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames as f64;
-            let total: Duration = self.stages.iter().sum();
-            // Skip stages that took no time at all (e.g. decode, for raw frames).
-            let stages: Vec<String> = names
-                .iter()
-                .zip(self.stages)
-                .filter(|(_, t)| !t.is_zero())
-                .map(|(n, t)| format!("{n} {:.2}", ms(t)))
-                .collect();
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.since.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    /// Average ms per frame overall and per stage, skipping stages that
+    /// took no time at all (e.g. decode, for raw frames).
+    fn averages(&self, names: [&str; 5]) -> (f64, Vec<(String, f64)>) {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames.max(1) as f64;
+        let total: Duration = self.stages.iter().sum();
+        let stages = names
+            .iter()
+            .zip(self.stages)
+            .filter(|(_, t)| !t.is_zero())
+            .map(|(n, t)| (n.to_string(), ms(t)))
+            .collect();
+        (ms(total), stages)
+    }
+}
+
+/// Accumulates per-stage processing times: logs averages every
+/// [`TIMING_INTERVAL`], and keeps ~1 s statistics for clients.
+#[derive(Default)]
+struct Timing {
+    log: Window,
+    live: Window,
+    /// Camera frames dropped because processing fell behind.
+    skipped: u32,
+    /// The latest ~1 s statistics (without the backend) and when they were
+    /// taken.
+    latest: Option<(Instant, Stats)>,
+}
+
+impl Timing {
+    fn record(&mut self, stages: [Duration; 5], names: [&str; 5]) {
+        self.log.add(stages);
+        self.live.add(stages);
+        let elapsed = self.live.elapsed();
+        if elapsed >= STATS_INTERVAL {
+            let (ms_per_frame, stages) = self.live.averages(names);
+            let fps = self.live.frames as f64 / elapsed.as_secs_f64();
+            let stats = Stats { fps, ms_per_frame, stages, backend: String::new() };
+            self.latest = Some((Instant::now(), stats));
+            self.live = Window::default();
+        }
+        if self.log.elapsed() >= TIMING_INTERVAL {
+            let (ms, stages) = self.log.averages(names);
+            let stages: Vec<String> = stages.iter().map(|(n, t)| format!("{n} {t:.2}")).collect();
             eprintln!(
-                "pipeline: {} frames ({} skipped), {:.2} ms/frame ({})",
-                self.frames,
+                "pipeline: {} frames ({} skipped), {ms:.2} ms/frame ({})",
+                self.log.frames,
                 self.skipped,
-                ms(total),
                 stages.join(", ")
             );
-            *self = Self { since: Some(Instant::now()), ..Self::default() };
+            self.log = Window::default();
+            self.skipped = 0;
+        }
+    }
+
+    /// The latest statistics, or zeros if nothing was processed lately.
+    fn stats(&self) -> Stats {
+        match &self.latest {
+            Some((at, stats)) if at.elapsed() < 2 * STATS_INTERVAL => stats.clone(),
+            _ => Stats::default(),
         }
     }
 }
@@ -277,6 +325,13 @@ impl CameraRelay {
             .and_then(|name| self.sources.formats(&name))
             .map(|pods| formats::camera_modes(&pods))
             .unwrap_or_default()
+    }
+
+    /// How the relay has been performing over the last second or so.
+    pub fn stats(&self) -> Stats {
+        let mut stats = self.state.borrow().timing.stats();
+        stats.backend = self.processor.borrow().describe();
+        stats
     }
 
     /// The current effect settings.
