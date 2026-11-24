@@ -25,9 +25,20 @@
           install -Dm755 usr/lib/x86_64-linux-gnu/libnpu_driver_compiler.so -t $out/lib
         '';
       };
+      pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        ps.openvino
+        ps.onnx
+      ]);
     in {
       devShells.x86_64-linux.default = pkgs.mkShell {
-        packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+        packages = with pkgs; [
+          cargo
+          rustc
+          clippy
+          rustfmt
+          rust-analyzer
+          pythonEnv
+        ];
         nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
         buildInputs = with pkgs; [ pipewire openvino vulkan-loader level-zero ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
