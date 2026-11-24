@@ -1,6 +1,6 @@
 //! Format negotiation helpers: reading the modes a camera offers, and
 //! building the EnumFormat pods for the virtual camera (always YUY2) and for
-//! the capture stream (whatever camera format we can unpack).
+//! the capture stream (whatever camera format we can unpack or decode).
 
 use pipewire::spa::{
     self,
@@ -9,6 +9,7 @@ use pipewire::spa::{
         format::{FormatProperties, MediaSubtype, MediaType},
         video::VideoFormat,
     },
+    pod::Pod,
     pod::{
         ChoiceValue, Object, Property, PropertyFlags, Value, deserialize::PodDeserializer,
         serialize::PodSerializer,
@@ -21,10 +22,30 @@ use crate::pipeline::InputFormat;
 /// Sizes the virtual camera offers when no camera is selected.
 const GENERIC_SIZES: [(u32, u32); 3] = [(1920, 1080), (1280, 720), (640, 360)];
 
+/// A camera format we can capture from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureFormat {
+    /// Uncompressed, in one of [`InputFormat::SUPPORTED`].
+    Raw(VideoFormat),
+    /// Motion JPEG, which has to be decoded first.
+    Mjpg,
+}
+
+impl CaptureFormat {
+    /// Lower is preferred: raw formats in [`InputFormat::SUPPORTED`] order,
+    /// then MJPG, which costs a decode per frame.
+    fn rank(self) -> usize {
+        match self {
+            Self::Raw(f) => InputFormat::SUPPORTED.iter().position(|&s| s == f).unwrap_or(usize::MAX),
+            Self::Mjpg => InputFormat::SUPPORTED.len(),
+        }
+    }
+}
+
 /// One format/size combination a camera supports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CameraMode {
-    pub format: VideoFormat,
+    pub format: CaptureFormat,
     pub width: u32,
     pub height: u32,
     /// Frame rates offered at this format and size, or `None` if the camera
@@ -40,37 +61,67 @@ impl CameraMode {
     }
 }
 
+/// The contents of a video format pod that we care about.
+struct ParsedFormat {
+    /// Formats we can capture, in the order listed.
+    formats: Vec<CaptureFormat>,
+    sizes: Vec<(u32, u32)>,
+    rates: Option<Vec<(u32, u32)>>,
+}
+
+fn parse_format(pod: &[u8]) -> Option<ParsedFormat> {
+    let Ok((_, Value::Object(object))) = PodDeserializer::deserialize_any_from(pod) else {
+        return None;
+    };
+    let prop = |key: FormatProperties| {
+        object
+            .properties
+            .iter()
+            .find(|p| p.key == key.as_raw())
+            .map(|p| &p.value)
+    };
+    let subtype = prop(FormatProperties::MediaSubtype).map(ids).unwrap_or_default();
+    let formats = match subtype.as_slice() {
+        [s] if *s == MediaSubtype::Raw.as_raw() => prop(FormatProperties::VideoFormat)
+            .map(ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(VideoFormat::from_raw)
+            .filter(|f| InputFormat::SUPPORTED.contains(f))
+            .map(CaptureFormat::Raw)
+            .collect(),
+        [s] if *s == MediaSubtype::Mjpg.as_raw() => vec![CaptureFormat::Mjpg],
+        _ => Vec::new(),
+    };
+    Some(ParsedFormat {
+        formats,
+        sizes: prop(FormatProperties::VideoSize)
+            .map(rectangles)
+            .unwrap_or_default(),
+        rates: prop(FormatProperties::VideoFramerate).and_then(fractions),
+    })
+}
+
 /// Expand a camera's EnumFormat pods into the modes we can capture from.
-/// Formats we can't unpack, and sizes given as ranges, are skipped.
+/// Formats we can't unpack or decode, and sizes given as ranges, are skipped.
 pub fn camera_modes(pods: &[Vec<u8>]) -> Vec<CameraMode> {
     let mut modes = Vec::new();
-    for pod in pods {
-        let Ok((_, Value::Object(object))) = PodDeserializer::deserialize_any_from(pod) else {
-            continue;
-        };
-        let prop = |key: FormatProperties| {
-            object
-                .properties
-                .iter()
-                .find(|p| p.key == key.as_raw())
-                .map(|p| &p.value)
-        };
-        let ids = prop(FormatProperties::VideoFormat).map(ids).unwrap_or_default();
-        let sizes = prop(FormatProperties::VideoSize)
-            .map(rectangles)
-            .unwrap_or_default();
-        let rates = prop(FormatProperties::VideoFramerate).and_then(fractions);
-        for id in ids {
-            let format = VideoFormat::from_raw(id);
-            if !InputFormat::SUPPORTED.contains(&format) {
-                continue;
-            }
-            for &(width, height) in &sizes {
-                modes.push(CameraMode { format, width, height, rates: rates.clone() });
+    for parsed in pods.iter().filter_map(|pod| parse_format(pod)) {
+        for &format in &parsed.formats {
+            for &(width, height) in &parsed.sizes {
+                modes.push(CameraMode { format, width, height, rates: parsed.rates.clone() });
             }
         }
     }
     modes
+}
+
+/// The format and size a camera settled on, from its negotiated Format pod.
+/// `None` if it isn't one we can capture.
+pub fn negotiated(pod: &Pod) -> Option<(CaptureFormat, u32, u32)> {
+    let parsed = parse_format(pod.as_bytes())?;
+    let (&format, &(width, height)) = (parsed.formats.first()?, parsed.sizes.first()?);
+    Some((format, width, height))
 }
 
 /// The virtual camera's formats for a camera with `modes`: YUY2 at every size
@@ -113,7 +164,8 @@ pub fn generic_output_formats() -> Vec<Vec<u8>> {
 
 /// Formats to request from a camera with `modes` to produce `width`x`height`
 /// frames at `rate`, most preferred first: modes that list `rate` before
-/// those that don't say, each in [`InputFormat::SUPPORTED`] order.
+/// those that don't say, raw formats (in [`InputFormat::SUPPORTED`] order)
+/// before MJPG.
 pub fn capture_formats(
     modes: &[CameraMode],
     width: u32,
@@ -125,21 +177,26 @@ pub fn capture_formats(
         .filter(|m| (m.width, m.height) == (width, height))
         .filter(|m| m.rates.is_none() || m.offers(rate))
         .collect();
-    let preference = |m: &CameraMode| {
-        let format_rank = InputFormat::SUPPORTED.iter().position(|&f| f == m.format);
-        (!m.offers(rate), format_rank)
-    };
+    let preference = |m: &CameraMode| (!m.offers(rate), m.format.rank());
     candidates.sort_by_key(|m| preference(m));
     candidates.dedup_by(|a, b| a.format == b.format);
     candidates
         .into_iter()
         .map(|m| {
-            let mut props = vec![
-                id_prop(FormatProperties::MediaType, MediaType::Video.as_raw()),
-                id_prop(FormatProperties::MediaSubtype, MediaSubtype::Raw.as_raw()),
-                id_prop(FormatProperties::VideoFormat, m.format.as_raw()),
-                prop(FormatProperties::VideoSize, Value::Rectangle(Rectangle { width, height })),
-            ];
+            let mut props = vec![id_prop(FormatProperties::MediaType, MediaType::Video.as_raw())];
+            match m.format {
+                CaptureFormat::Raw(format) => {
+                    props.push(id_prop(FormatProperties::MediaSubtype, MediaSubtype::Raw.as_raw()));
+                    props.push(id_prop(FormatProperties::VideoFormat, format.as_raw()));
+                }
+                CaptureFormat::Mjpg => {
+                    props.push(id_prop(FormatProperties::MediaSubtype, MediaSubtype::Mjpg.as_raw()));
+                }
+            }
+            props.push(prop(
+                FormatProperties::VideoSize,
+                Value::Rectangle(Rectangle { width, height }),
+            ));
             if m.rates.is_some() {
                 let (num, denom) = rate;
                 props.push(prop(
@@ -271,6 +328,18 @@ fn same_rate(a: (u32, u32), b: (u32, u32)) -> bool {
 mod tests {
     use super::*;
 
+    fn mjpg_pod(size: Value, rate: Option<Value>) -> Vec<u8> {
+        let mut props = vec![
+            id_prop(FormatProperties::MediaType, MediaType::Video.as_raw()),
+            id_prop(FormatProperties::MediaSubtype, MediaSubtype::Mjpg.as_raw()),
+            prop(FormatProperties::VideoSize, size),
+        ];
+        if let Some(rate) = rate {
+            props.push(prop(FormatProperties::VideoFramerate, rate));
+        }
+        serialize(enum_format(props))
+    }
+
     fn camera_pod(format: Value, size: Value, rate: Option<Value>) -> Vec<u8> {
         let mut props = vec![
             id_prop(FormatProperties::MediaType, MediaType::Video.as_raw()),
@@ -304,7 +373,12 @@ mod tests {
     }
 
     fn mode(format: VideoFormat, w: u32, h: u32, rates: Option<&[(u32, u32)]>) -> CameraMode {
+        let format = CaptureFormat::Raw(format);
         CameraMode { format, width: w, height: h, rates: rates.map(<[_]>::to_vec) }
+    }
+
+    fn mjpg(w: u32, h: u32, rates: &[(u32, u32)]) -> CameraMode {
+        CameraMode { format: CaptureFormat::Mjpg, width: w, height: h, rates: Some(rates.to_vec()) }
     }
 
     #[test]
@@ -385,5 +459,55 @@ mod tests {
                 mode(VideoFormat::RGBx, 640, 360, None),
             ]
         );
+    }
+
+    #[test]
+    fn parses_mjpg_modes() {
+        let pods = [
+            mjpg_pod(rect(1920, 1080), Some(rate_enum(&[(60, 1), (30, 1)]))),
+            // Some other compressed format we can't decode.
+            {
+                let props = vec![
+                    id_prop(FormatProperties::MediaType, MediaType::Video.as_raw()),
+                    id_prop(FormatProperties::MediaSubtype, MediaSubtype::H264.as_raw()),
+                    prop(FormatProperties::VideoSize, rect(1920, 1080)),
+                ];
+                serialize(enum_format(props))
+            },
+        ];
+        assert_eq!(camera_modes(&pods), [mjpg(1920, 1080, &[(60, 1), (30, 1)])]);
+    }
+
+    #[test]
+    fn capture_formats_use_mjpg_only_when_raw_cannot() {
+        let modes = [
+            mjpg(1920, 1080, &[(60, 1), (30, 1), (5, 1)]),
+            mode(VideoFormat::YUY2, 1920, 1080, Some(&[(5, 1)])),
+        ];
+        // 30 fps: only MJPG can do it.
+        assert_eq!(
+            camera_modes(&capture_formats(&modes, 1920, 1080, (30, 1))),
+            [mjpg(1920, 1080, &[(30, 1)])]
+        );
+        // 5 fps: both can, raw first.
+        assert_eq!(
+            camera_modes(&capture_formats(&modes, 1920, 1080, (5, 1))),
+            [mode(VideoFormat::YUY2, 1920, 1080, Some(&[(5, 1)])), mjpg(1920, 1080, &[(5, 1)])]
+        );
+        // The output offers the union of rates at that size.
+        assert_eq!(
+            camera_modes(&output_formats(&modes)),
+            [mode(VideoFormat::YUY2, 1920, 1080, Some(&[(60, 1), (30, 1), (5, 1)]))]
+        );
+    }
+
+    #[test]
+    fn reads_negotiated_format() {
+        let pod = mjpg_pod(rect(1280, 720), Some(Value::Fraction(Fraction { num: 30, denom: 1 })));
+        let pod = Pod::from_bytes(&pod).unwrap();
+        assert_eq!(negotiated(pod), Some((CaptureFormat::Mjpg, 1280, 720)));
+        let pod = camera_pod(fmt(VideoFormat::BGRx), rect(640, 480), None);
+        let pod = Pod::from_bytes(&pod).unwrap();
+        assert_eq!(negotiated(pod), Some((CaptureFormat::Raw(VideoFormat::BGRx), 640, 480)));
     }
 }
