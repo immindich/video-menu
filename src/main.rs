@@ -13,6 +13,7 @@
 
 mod commands;
 mod formats;
+mod gpu;
 mod model;
 mod pipeline;
 mod relay;
