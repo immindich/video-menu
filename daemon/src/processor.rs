@@ -334,7 +334,7 @@ mod tests {
     /// A realistic 1080p webcam MJPG frame: `testimage.jpg` re-encoded at
     /// quality 85 with 4:2:2 chroma, or a synthetic pattern without it.
     fn bench_jpeg(w: usize, h: usize) -> Vec<u8> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testimage.jpg");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../testimage.jpg");
         let px = match std::fs::read(path) {
             Ok(jpg) => {
                 let img = turbojpeg::decompress(&jpg, turbojpeg::PixelFormat::RGBX).unwrap();
@@ -432,7 +432,7 @@ mod tests {
     #[ignore]
     fn real_model_on_testimage() {
         const FRAMES: usize = 8;
-        let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testimage.jpg"))
+        let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../testimage.jpg"))
             .expect("testimage.jpg");
         let header = turbojpeg::read_header(&jpg).unwrap();
         let (w, h) = (header.width, header.height);
