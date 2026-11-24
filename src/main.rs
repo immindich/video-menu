@@ -14,11 +14,14 @@
 //!
 //! Frames are processed on the GPU (Vulkan via wgpu) when one is available,
 //! otherwise on the CPU; set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force one.
-//! `VIDEO_MENU_EFFECT=flip` flips frames instead of running the model, and
-//! `VIDEO_MENU_MODEL_DEVICE` chooses the device the model runs on (default:
-//! the NPU). The model is loaded from `VIDEO_MENU_MODEL`, or from
-//! `rvm_mobilenetv3_fp16_core.onnx` in the current directory if that is unset
-//! or doesn't exist.
+//!
+//! Other settings:
+//! - `VIDEO_MENU_EFFECT=flip` flips frames instead of running the model.
+//! - `VIDEO_MENU_MODEL` is the model file; if it is unset or doesn't exist,
+//!   `rvm_mobilenetv3_fp16_core.onnx` in the current directory is used.
+//! - `VIDEO_MENU_MODEL_DEVICE` is the device the model runs on (default NPU).
+//! - `VIDEO_MENU_NPU_TURBO=1` trades CPU time for slightly lower model
+//!   latency when the camera is slow (see `model.rs`).
 
 mod commands;
 mod formats;

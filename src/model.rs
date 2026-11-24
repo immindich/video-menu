@@ -68,11 +68,31 @@ impl RvmMatte {
         }
         let mut core = Core::new().map_err(|e| format!("OpenVINO: {e}"))?;
         let dev: DeviceType = device.parse().map_err(|e| format!("device {device}: {e}"))?;
+        let mut turbo = false;
         if dev == DeviceType::NPU {
             // nixpkgs' openvino doesn't ship the plugin compiler
             // (libopenvino_intel_npu_compiler.so); use the NPU driver's.
             core.set_property(&dev, &RwPropertyKey::Other("NPU_COMPILER_TYPE".into()), "DRIVER")
                 .map_err(ov_err("NPU compiler"))?;
+            // Between camera frames the NPU idles and clocks down, so an
+            // inference paced at 30 fps takes ~15 ms against ~10.5 ms back to
+            // back. Turbo avoids that, but the driver then busy-waits for the
+            // NPU: inference costs ~12 ms of CPU instead of ~2 ms. Measured at
+            // 1080p:
+            // - NexiGo (MJPG): the model drops from ~17.6 to ~11.3 ms, but
+            //   MJPG decoding slows by ~2 ms (the spinning core competes with
+            //   it), so frames get ~3.6 ms (~9%) faster for ~1/3 of a core.
+            // - Built-in camera (~50 fps): the NPU never idles long enough to
+            //   slow down, so turbo gains nothing and still costs ~45% of a
+            //   core.
+            // Opt in with VIDEO_MENU_NPU_TURBO=1.
+            turbo = std::env::var("VIDEO_MENU_NPU_TURBO").as_deref() == Ok("1");
+            core.set_property(
+                &dev,
+                &RwPropertyKey::Other("NPU_TURBO".into()),
+                if turbo { "YES" } else { "NO" },
+            )
+            .map_err(ov_err("NPU turbo"))?;
         }
         // Compiling for the NPU takes ~10 s; cache the result between runs.
         if let Some(cache) = cache_dir()
@@ -97,7 +117,8 @@ impl RvmMatte {
 
         let start = Instant::now();
         let mut compiled = core.compile_model(&model, dev).map_err(ov_err("compiling model"))?;
-        eprintln!("model: compiled for {device} in {:.1}s", start.elapsed().as_secs_f64());
+        let mode = if turbo { " (turbo)" } else { "" };
+        eprintln!("model: compiled for {device}{mode} in {:.1}s", start.elapsed().as_secs_f64());
         let request = compiled.create_infer_request().map_err(ov_err("infer request"))?;
 
         let tensor = |dims: &[i64]| -> Result<Tensor, String> {
