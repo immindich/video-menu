@@ -3,6 +3,7 @@
 //! Capture and output negotiate formats independently: the camera delivers
 //! whatever supported format it prefers, each frame is unpacked to planar RGB
 //! (see [`crate::pipeline`]), run through the effects, and packed as YUY2
+//! by a [`Processor`] on the GPU or CPU
 //! (BT.601, limited range) for applications.
 
 use std::{
@@ -38,7 +39,8 @@ use spa::{
 
 use crate::{
     formats::{self, CameraMode, serialize},
-    pipeline::{self, Effect, InputFormat, PlanarFrame, VerticalFlip},
+    pipeline::InputFormat,
+    processor::Processor,
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -57,8 +59,6 @@ struct State {
     stride: usize,
     /// Format the camera is delivering, once capture has negotiated.
     input: Option<(InputFormat, VideoInfoRaw)>,
-    /// The current camera frame as planar RGB, as effects see it.
-    planar: PlanarFrame,
     /// Most recent processed frame as YUY2, ready to hand to the consumer.
     frame: Vec<u8>,
     /// Presentation timestamp (ns, CLOCK_MONOTONIC) of `frame`.
@@ -74,27 +74,30 @@ struct State {
 #[derive(Default)]
 struct Timing {
     frames: u32,
-    unpack: Duration,
-    effects: Duration,
-    pack: Duration,
+    stages: [Duration; 3],
     since: Option<Instant>,
 }
 
 impl Timing {
-    fn record(&mut self, unpack: Duration, effects: Duration, pack: Duration) {
+    fn record(&mut self, stages: [Duration; 3], names: [&str; 3]) {
         self.frames += 1;
-        self.unpack += unpack;
-        self.effects += effects;
-        self.pack += pack;
+        for (total, t) in self.stages.iter_mut().zip(stages) {
+            *total += t;
+        }
         let since = *self.since.get_or_insert_with(Instant::now);
         if since.elapsed() >= TIMING_INTERVAL {
             let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames as f64;
+            let total: Duration = self.stages.iter().sum();
             eprintln!(
-                "pipeline: {} frames, unpack {:.2} ms, effects {:.2} ms, pack {:.2} ms",
+                "pipeline: {} frames, {:.2} ms/frame ({} {:.2}, {} {:.2}, {} {:.2})",
                 self.frames,
-                ms(self.unpack),
-                ms(self.effects),
-                ms(self.pack)
+                ms(total),
+                names[0],
+                ms(self.stages[0]),
+                names[1],
+                ms(self.stages[1]),
+                names[2],
+                ms(self.stages[2]),
             );
             *self = Self { since: Some(Instant::now()), ..Self::default() };
         }
@@ -112,8 +115,8 @@ pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
     state: RefCell<State>,
-    /// Effects applied to each frame, in order.
-    effects: RefCell<Vec<Box<dyn Effect>>>,
+    /// Turns camera frames into processed YUY2 frames.
+    processor: RefCell<Processor>,
     /// Name of the video source being relayed, if any.
     camera: RefCell<Option<String>>,
     /// Live list of video sources the relay could capture from.
@@ -132,7 +135,11 @@ impl CameraRelay {
     /// Create the capture and virtual camera streams, with no camera
     /// selected. Nothing appears in the graph until
     /// [`publish`](Self::publish) is called.
-    pub fn new(core: &CoreRc, sources: VideoSources) -> Result<Rc<Self>, pw::Error> {
+    pub fn new(
+        core: &CoreRc,
+        sources: VideoSources,
+        processor: Processor,
+    ) -> Result<Rc<Self>, pw::Error> {
         let input = StreamRc::new(
             core.clone(),
             "video-menu-capture",
@@ -160,7 +167,7 @@ impl CameraRelay {
             input,
             output,
             state: RefCell::default(),
-            effects: RefCell::new(vec![Box::new(VerticalFlip)]),
+            processor: RefCell::new(processor),
             camera: RefCell::default(),
             sources,
             start: Instant::now(),
@@ -370,20 +377,23 @@ impl CameraRelay {
                 input.row_bytes(width)
             };
 
-            let t0 = Instant::now();
-            st.planar.resize(width, height);
-            if !pipeline::unpack(input, src, src_stride, &mut st.planar) {
-                eprintln!("capture: short frame ({size} bytes), dropping");
-                return;
-            }
-            let t1 = Instant::now();
-            for effect in self.effects.borrow_mut().iter_mut() {
-                effect.apply(&mut st.planar);
-            }
-            let t2 = Instant::now();
             st.frame.resize(st.stride * height, 0);
-            pipeline::pack_yuy2_bt601(&st.planar, &mut st.frame, st.stride);
-            st.timing.record(t1 - t0, t2 - t1, t2.elapsed());
+            let mut processor = self.processor.borrow_mut();
+            match processor.process(
+                input,
+                src,
+                src_stride,
+                width,
+                height,
+                &mut st.frame,
+                st.stride,
+            ) {
+                Ok(stages) => st.timing.record(stages, processor.stage_names()),
+                Err(e) => {
+                    eprintln!("capture: dropping frame: {e}");
+                    return;
+                }
+            }
 
             (st.pts, st.seq) = match header {
                 Some((pts, seq)) if pts > 0 => (pts, seq),
