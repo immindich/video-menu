@@ -1,7 +1,8 @@
 //! Virtual camera daemon.
 //!
-//! Exposes a PipeWire `Video/Source` node that mirrors a real webcam, flipped
-//! vertically. The real camera is only opened while some client is actually
+//! Exposes a PipeWire `Video/Source` node that mirrors a real webcam. Frames
+//! are converted to planar RGB, run through effects (currently a vertical
+//! flip as a placeholder), and offered to applications as YUY2. The real camera is only opened while some client is actually
 //! streaming from the virtual node; otherwise it stays idle (and suspended).
 //!
 //! Usage: `video-menu [CAMERA_NODE_NAME]`. Without an argument, the first

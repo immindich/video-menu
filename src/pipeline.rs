@@ -171,7 +171,7 @@ pub struct VerticalFlip;
 
 impl Effect for VerticalFlip {
     fn apply(&mut self, frame: &mut PlanarFrame) {
-        let (width, height) = (frame.width, frame.height);
+        let (width, height) = (frame.width(), frame.height());
         for plane in frame.planes_mut() {
             for y in 0..height / 2 {
                 let (top, bottom) = plane.split_at_mut((height - 1 - y) * width);

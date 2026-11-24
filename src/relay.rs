@@ -1,12 +1,16 @@
-//! Relay that mirrors a real camera onto a virtual PipeWire camera node,
-//! flipping frames vertically on the way.
+//! Relay that mirrors a real camera onto a virtual PipeWire camera node.
+//!
+//! Capture and output negotiate formats independently: the camera delivers
+//! whatever supported format it prefers, each frame is unpacked to planar RGB
+//! (see [`crate::pipeline`]), run through the effects, and packed as YUY2
+//! (BT.601, limited range) for applications.
 
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     error::Error,
     rc::Rc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use pipewire as pw;
@@ -25,32 +29,37 @@ use spa::{
     buffer::meta::MetaHeader,
     param::{
         ParamType,
-        format::{FormatProperties, MediaSubtype, MediaType},
+        format::{MediaSubtype, MediaType},
         video::{VideoFormat, VideoInfoRaw},
     },
-    pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer},
-    utils::{
-        Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes,
-        result::SpaResult,
-    },
+    pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value},
+    utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, SpaTypes, result::SpaResult},
+};
+
+use crate::{
+    formats::{self, CameraMode, serialize},
+    pipeline::{self, Effect, InputFormat, PlanarFrame, VerticalFlip},
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
 const OUTPUT_DESCRIPTION: &str = "Video Menu Camera";
 const INPUT_NODE_NAME: &str = "video-menu.capture";
 
+/// How often per-stage frame timings are logged.
+const TIMING_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Mutable state of a [`CameraRelay`], shared by its stream callbacks.
 #[derive(Default)]
 struct State {
-    /// Format negotiated with the consumer of the virtual camera.
+    /// Format negotiated with the consumer of the virtual camera (YUY2).
     format: Option<VideoInfoRaw>,
-    /// That same format as an EnumFormat pod, used to request it from the camera.
-    format_pod: Option<Vec<u8>>,
     /// Row stride of frames we produce.
     stride: usize,
-    /// Bytes per row that carry pixel data.
-    row_bytes: usize,
-    /// Most recent flipped frame, ready to hand to the consumer.
+    /// Format the camera is delivering, once capture has negotiated.
+    input: Option<(InputFormat, VideoInfoRaw)>,
+    /// The current camera frame as planar RGB, as effects see it.
+    planar: PlanarFrame,
+    /// Most recent processed frame as YUY2, ready to hand to the consumer.
     frame: Vec<u8>,
     /// Presentation timestamp (ns, CLOCK_MONOTONIC) of `frame`.
     pts: i64,
@@ -58,6 +67,38 @@ struct State {
     seq: u64,
     /// Whether the capture stream is currently connected to the camera.
     capturing: bool,
+    timing: Timing,
+}
+
+/// Accumulates per-stage processing times and logs their averages.
+#[derive(Default)]
+struct Timing {
+    frames: u32,
+    unpack: Duration,
+    effects: Duration,
+    pack: Duration,
+    since: Option<Instant>,
+}
+
+impl Timing {
+    fn record(&mut self, unpack: Duration, effects: Duration, pack: Duration) {
+        self.frames += 1;
+        self.unpack += unpack;
+        self.effects += effects;
+        self.pack += pack;
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= TIMING_INTERVAL {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames as f64;
+            eprintln!(
+                "pipeline: {} frames, unpack {:.2} ms, effects {:.2} ms, pack {:.2} ms",
+                self.frames,
+                ms(self.unpack),
+                ms(self.effects),
+                ms(self.pack)
+            );
+            *self = Self { since: Some(Instant::now()), ..Self::default() };
+        }
+    }
 }
 
 /// Moves frames from a real camera to a virtual one, flipping them on the way.
@@ -71,6 +112,8 @@ pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
     state: RefCell<State>,
+    /// Effects applied to each frame, in order.
+    effects: RefCell<Vec<Box<dyn Effect>>>,
     /// Name of the video source being relayed, if any.
     camera: RefCell<Option<String>>,
     /// Live list of video sources the relay could capture from.
@@ -117,6 +160,7 @@ impl CameraRelay {
             input,
             output,
             state: RefCell::default(),
+            effects: RefCell::new(vec![Box::new(VerticalFlip)]),
             camera: RefCell::default(),
             sources,
             start: Instant::now(),
@@ -135,31 +179,34 @@ impl CameraRelay {
 
     /// Relay from the video source called `name`, or from nothing if `None`.
     ///
-    /// The virtual camera's advertised formats are replaced with the new
-    /// source's (or generic ones), so a consumer that is already streaming
-    /// renegotiates if its format is no longer offered. Fails, leaving the
-    /// current selection alone, if `name` is unknown or its formats have not
-    /// been probed.
+    /// The virtual camera's advertised formats are replaced with ones the new
+    /// source can supply (or generic ones), so a consumer that is already
+    /// streaming renegotiates if its format is no longer offered. Fails,
+    /// leaving the current selection alone, if `name` is unknown or offers no
+    /// format we can capture (including when its formats haven't arrived yet).
     pub fn set_camera(&self, name: Option<&str>) -> Result<(), Box<dyn Error>> {
         let formats = match name {
             Some(name) => {
-                let formats = self
+                let pods = self
                     .sources
                     .formats(name)
                     .ok_or_else(|| format!("no video source named {name}"))?;
-                if formats.is_empty() {
-                    return Err(format!("video source {name} reported no formats").into());
+                let modes = formats::camera_modes(&pods);
+                if modes.is_empty() {
+                    return Err(
+                        format!("video source {name} offers no format we can capture").into(),
+                    );
                 }
-                formats
+                formats::output_formats(&modes)
             }
-            None => vec![generic_formats()],
+            None => formats::generic_output_formats(),
         };
 
         self.stop_capture();
         self.set_target(name.unwrap_or(""))?;
         *self.camera.borrow_mut() = name.map(str::to_owned);
         match name {
-            Some(name) => eprintln!("relay: using {name} ({} formats)", formats.len()),
+            Some(name) => eprintln!("relay: using {name} ({} output sizes)", formats.len()),
             None => eprintln!("relay: no camera"),
         }
 
@@ -171,6 +218,14 @@ impl CameraRelay {
 
         self.resume_capture();
         Ok(())
+    }
+
+    /// Capturable modes of the selected camera; empty if there is none.
+    fn camera_modes(&self) -> Vec<CameraMode> {
+        self.camera()
+            .and_then(|name| self.sources.formats(&name))
+            .map(|pods| formats::camera_modes(&pods))
+            .unwrap_or_default()
     }
 
     /// Point the capture stream at `target`. Takes effect on the next connect.
@@ -221,14 +276,15 @@ impl CameraRelay {
         })
     }
 
-    /// Add the virtual camera to the graph, offering the selected camera's
-    /// formats, or generic ones if no camera is selected.
+    /// Add the virtual camera to the graph, offering YUY2 at the sizes the
+    /// selected camera supports, or generic sizes if no camera is selected.
     pub fn publish(&self) -> Result<(), pw::Error> {
-        let formats = self
-            .camera()
-            .and_then(|name| self.sources.formats(&name))
-            .filter(|formats| !formats.is_empty())
-            .unwrap_or_else(|| vec![generic_formats()]);
+        let modes = self.camera_modes();
+        let formats = if modes.is_empty() {
+            formats::generic_output_formats()
+        } else {
+            formats::output_formats(&modes)
+        };
         let mut params: Vec<&Pod> = formats
             .iter()
             .filter_map(|bytes| Pod::from_bytes(bytes))
@@ -243,26 +299,43 @@ impl CameraRelay {
 
     // ---- input (capture) side ----
 
-    /// The camera settled on a format; check it is the one we asked for.
+    /// The camera settled on a format: remember how to unpack it.
     fn on_input_format(&self, param: &Pod) {
         let mut info = VideoInfoRaw::new();
         if info.parse(param).is_err() {
             return;
         }
         let (fmt, size) = (info.format(), info.size());
-        eprintln!(
-            "capture: camera format {fmt:?} {}x{}",
-            size.width, size.height
-        );
-        if let Some(want) = self.state.borrow().format
-            && (want.format() != fmt || want.size() != size)
+        eprintln!("capture: camera format {fmt:?} {}x{}", size.width, size.height);
+        let mut st = self.state.borrow_mut();
+        st.input = None;
+        let Some(input) = InputFormat::from_video_format(fmt) else {
+            eprintln!("capture: cannot unpack {fmt:?}");
+            return;
+        };
+        if let Some(out) = st.format
+            && out.size() != size
         {
-            eprintln!("capture: camera format does not match requested format");
+            eprintln!(
+                "capture: camera size does not match consumer's {}x{}",
+                out.size().width,
+                out.size().height
+            );
+            return;
         }
+        let matrix = info.color_matrix();
+        if input == InputFormat::Yuy2
+            && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_UNKNOWN
+            && matrix != spa::sys::SPA_VIDEO_COLOR_MATRIX_BT601
+        {
+            eprintln!("capture: camera uses color matrix {matrix}; decoding as BT.601");
+        }
+        st.input = Some((input, info));
     }
 
-    /// A camera frame arrived: flip it into `state.frame`, then drive the
-    /// virtual camera's graph so the consumer gets it.
+    /// A camera frame arrived: unpack it to planar RGB, apply the effects,
+    /// pack it into `state.frame` as YUY2, then drive the virtual camera's
+    /// graph so the consumer gets it.
     fn on_input_frame(&self) {
         let Some(mut buffer) = self.input.dequeue_buffer() else {
             return;
@@ -287,25 +360,31 @@ impl CameraRelay {
 
         {
             let st = &mut *self.state.borrow_mut();
-            let Some(format) = st.format else { return };
-            let height = format.size().height as usize;
+            let (Some(format), Some((input, _))) = (st.format, st.input) else {
+                return;
+            };
+            let (width, height) = (format.size().width as usize, format.size().height as usize);
             let src_stride = if src_stride > 0 {
                 src_stride as usize
             } else {
-                st.row_bytes
+                input.row_bytes(width)
             };
-            st.frame.resize(st.stride * height, 0);
-            if !flip_vertical(
-                src,
-                src_stride,
-                &mut st.frame,
-                st.stride,
-                st.row_bytes,
-                height,
-            ) {
+
+            let t0 = Instant::now();
+            st.planar.resize(width, height);
+            if !pipeline::unpack(input, src, src_stride, &mut st.planar) {
                 eprintln!("capture: short frame ({size} bytes), dropping");
                 return;
             }
+            let t1 = Instant::now();
+            for effect in self.effects.borrow_mut().iter_mut() {
+                effect.apply(&mut st.planar);
+            }
+            let t2 = Instant::now();
+            st.frame.resize(st.stride * height, 0);
+            pipeline::pack_yuy2_bt601(&st.planar, &mut st.frame, st.stride);
+            st.timing.record(t1 - t0, t2 - t1, t2.elapsed());
+
             (st.pts, st.seq) = match header {
                 Some((pts, seq)) if pts > 0 => (pts, seq),
                 _ => (
@@ -321,22 +400,35 @@ impl CameraRelay {
         }
     }
 
-    /// Connect the capture stream to the camera with the consumer's format.
+    /// Connect the capture stream to the camera, asking for a format we can
+    /// unpack at the consumer's size and frame rate.
     fn start_capture(&self) {
-        if self.camera.borrow().is_none() {
-            return;
-        }
-        let pod = {
+        let format = {
             let st = self.state.borrow();
             if st.capturing {
                 return;
             }
-            match &st.format_pod {
-                Some(pod) => pod.clone(),
+            match st.format {
+                Some(format) => format,
                 None => return,
             }
         };
-        let mut params = [Pod::from_bytes(&pod).unwrap()];
+        let modes = self.camera_modes();
+        if modes.is_empty() {
+            return;
+        }
+        let (size, rate) = (format.size(), format.framerate());
+        let pods = formats::capture_formats(&modes, size.width, size.height, (rate.num, rate.denom));
+        if pods.is_empty() {
+            eprintln!(
+                "capture: camera offers nothing at {}x{} {}/{} fps",
+                size.width, size.height, rate.num, rate.denom
+            );
+            return;
+        }
+        let buffers = serialize(input_buffers_param());
+        let mut params: Vec<&Pod> = pods.iter().filter_map(|p| Pod::from_bytes(p)).collect();
+        params.extend(Pod::from_bytes(&buffers));
         match self.input.connect(
             Direction::Input,
             None,
@@ -368,7 +460,9 @@ impl CameraRelay {
                 return;
             }
             st.capturing = false;
+            st.input = None;
             st.frame.clear();
+            st.timing = Timing::default();
         }
         if let Err(e) = self.input.disconnect() {
             eprintln!("capture: disconnect failed: {e}");
@@ -394,29 +488,29 @@ impl CameraRelay {
 
         let mut st = self.state.borrow_mut();
         st.format = None;
-        st.format_pod = None;
         let Some(param) = param else { return };
 
         let mut info = VideoInfoRaw::new();
         if info.parse(param).is_err() {
             return;
         }
-        let size = info.size();
-        let Some(bpp) = bytes_per_pixel(info.format()) else {
-            eprintln!("camera: unsupported format {:?}", info.format());
-            return;
-        };
+        let (size, rate) = (info.size(), info.framerate());
         eprintln!(
-            "camera: consumer format {:?} {}x{}",
+            "camera: consumer format {:?} {}x{} {}/{} fps",
             info.format(),
             size.width,
-            size.height
+            size.height,
+            rate.num,
+            rate.denom
         );
+        // We only ever offer YUY2, at even widths.
+        if info.format() != VideoFormat::YUY2 || size.width % 2 != 0 {
+            eprintln!("camera: unexpected consumer format, not producing frames");
+            return;
+        }
 
-        st.row_bytes = size.width as usize * bpp;
-        st.stride = (st.row_bytes + 3) & !3;
+        st.stride = (size.width as usize * 2 + 3) & !3;
         st.format = Some(info);
-        st.format_pod = Some(as_enum_format(param));
 
         let buffers = serialize(buffers_param(
             st.stride as i32,
@@ -449,102 +543,6 @@ impl CameraRelay {
     }
 }
 
-/// Copy `height` rows of `row_bytes` from `src` into `dst` in reverse order.
-/// Returns false if `src` is too short to hold the frame.
-fn flip_vertical(
-    src: &[u8],
-    src_stride: usize,
-    dst: &mut [u8],
-    dst_stride: usize,
-    row_bytes: usize,
-    height: usize,
-) -> bool {
-    if height == 0 || src.len() < (height - 1) * src_stride + row_bytes {
-        return false;
-    }
-    for (y, src_row) in src.chunks(src_stride).take(height).enumerate() {
-        let dst_row = &mut dst[(height - 1 - y) * dst_stride..][..row_bytes];
-        dst_row.copy_from_slice(&src_row[..row_bytes]);
-    }
-    true
-}
-
-/// Bytes per pixel for single-plane packed formats, which can be flipped by
-/// reversing rows. Planar formats are not supported.
-fn bytes_per_pixel(format: VideoFormat) -> Option<usize> {
-    use VideoFormat as F;
-    let packed: [(&[VideoFormat], usize); 4] = [
-        (
-            &[
-                F::RGBx,
-                F::BGRx,
-                F::xRGB,
-                F::xBGR,
-                F::RGBA,
-                F::BGRA,
-                F::ARGB,
-                F::ABGR,
-            ],
-            4,
-        ),
-        (&[F::RGB, F::BGR], 3),
-        (&[F::YUY2, F::UYVY, F::YVYU, F::VYUY], 2),
-        (&[F::GRAY8], 1),
-    ];
-    packed
-        .iter()
-        .find(|(formats, _)| formats.contains(&format))
-        .map(|&(_, bpp)| bpp)
-}
-
-/// An EnumFormat pod offering common packed formats at any size, advertised
-/// while no camera is selected.
-fn generic_formats() -> Vec<u8> {
-    serialize(spa::pod::object!(
-        SpaTypes::ObjectParamFormat,
-        ParamType::EnumFormat,
-        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        spa::pod::property!(
-            FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::YUY2,
-            VideoFormat::YUY2,
-            VideoFormat::RGBx,
-            VideoFormat::BGRx
-        ),
-        spa::pod::property!(
-            FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            Rectangle { width: 1280, height: 720 },
-            Rectangle { width: 1, height: 1 },
-            Rectangle { width: 4096, height: 4096 }
-        ),
-        spa::pod::property!(
-            FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            Fraction { num: 30, denom: 1 },
-            Fraction { num: 0, denom: 1 },
-            Fraction { num: 120, denom: 1 }
-        ),
-    ))
-}
-
-/// Re-tag a negotiated Format pod as an EnumFormat pod so it can be offered to
-/// `pw_stream_connect`.
-fn as_enum_format(format: &Pod) -> Vec<u8> {
-    let mut bytes = format.as_bytes().to_vec();
-    // struct spa_pod_object { struct spa_pod pod; struct spa_pod_object_body { u32 type; u32 id; } }
-    bytes[12..16].copy_from_slice(&ParamType::EnumFormat.as_raw().to_ne_bytes());
-    bytes
-}
-
 fn buffers_param(stride: i32, size: i32) -> Object {
     let int = |key, value| Property {
         key,
@@ -574,6 +572,25 @@ fn buffers_param(stride: i32, size: i32) -> Object {
     }
 }
 
+/// Buffer memory the capture stream accepts: memory it can map. Without this,
+/// V4L2 cameras offer DMA-BUFs and linking fails with "mix use buffers
+/// failed: -22".
+fn input_buffers_param() -> Object {
+    let types = (1 << spa::sys::SPA_DATA_MemPtr) | (1 << spa::sys::SPA_DATA_MemFd);
+    Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![Property {
+            key: spa::sys::SPA_PARAM_BUFFERS_dataType,
+            flags: PropertyFlags::empty(),
+            value: Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Flags { default: types, flags: vec![types] },
+            ))),
+        }],
+    }
+}
+
 /// Ask for a `spa_meta_header` on each output buffer, which carries the
 /// frame's timestamp and sequence number.
 fn header_meta_param() -> Object {
@@ -595,7 +612,7 @@ fn header_meta_param() -> Object {
     }
 }
 
-/// Copy the latest flipped frame and its timestamp into an output buffer.
+/// Copy the latest processed frame and its timestamp into an output buffer.
 ///
 /// # Safety
 /// `buffer` must be a valid, mapped buffer dequeued from the output stream.
@@ -635,13 +652,6 @@ unsafe fn fill_output_buffer(buffer: *mut spa::sys::spa_buffer, st: &State) {
             chunk.size = len as u32;
         }
     }
-}
-
-fn serialize(object: Object) -> Vec<u8> {
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
-        .expect("pod serialization")
-        .0
-        .into_inner()
 }
 
 /// Run the loop until the server has processed everything sent so far.
