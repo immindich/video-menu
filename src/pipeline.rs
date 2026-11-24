@@ -136,7 +136,7 @@ pub fn unpack(format: InputFormat, src: &[u8], stride: usize, frame: &mut Planar
 /// `frame`'s width must be even and `dst` must hold `stride * height` bytes.
 pub fn pack_yuy2_bt601(frame: &PlanarFrame, dst: &mut [u8], stride: usize) {
     let width = frame.width;
-    debug_assert!(width % 2 == 0, "YUY2 needs an even width");
+    debug_assert!(width.is_multiple_of(2), "YUY2 needs an even width");
     debug_assert!(stride >= width * 2 && dst.len() >= stride * frame.height);
     let to_u8 = |v: f32| (v.clamp(0.0, 255.0) + 0.5) as u8;
     let luma = |r: f32, g: f32, b: f32| to_u8(16.0 + 65.481 * r + 128.553 * g + 24.966 * b);

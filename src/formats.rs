@@ -212,9 +212,9 @@ fn id_prop(key: FormatProperties, id: u32) -> Property {
 // ---- pod reading ----
 
 /// All values of a choice: the alternatives of an enum, or the single value.
-fn choice_values<T: Copy>(choice: &ChoiceEnum<T>) -> Option<Vec<T>>
+fn choice_values<T>(choice: &ChoiceEnum<T>) -> Option<Vec<T>>
 where
-    T: spa::pod::CanonicalFixedSizedPod,
+    T: Copy + spa::pod::CanonicalFixedSizedPod,
 {
     match choice {
         ChoiceEnum::None(v) => Some(vec![*v]),
