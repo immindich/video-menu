@@ -38,6 +38,9 @@
           rustfmt
           rust-analyzer
           pythonEnv
+          vulkan-tools
+          vulkan-validation-layers
+          shaderc
         ];
         nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
         buildInputs = with pkgs; [
@@ -49,7 +52,7 @@
         ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
-        LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
       };
     };
 }
