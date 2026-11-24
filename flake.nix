@@ -40,7 +40,13 @@
           pythonEnv
         ];
         nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
-        buildInputs = with pkgs; [ pipewire openvino vulkan-loader level-zero ];
+        buildInputs = with pkgs; [
+          pipewire
+          openvino
+          vulkan-loader
+          level-zero
+          libjpeg_turbo
+        ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
         LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
