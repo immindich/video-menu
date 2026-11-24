@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 
 use pipewire::spa::param::video::VideoFormat;
 
+use video_menu_protocol::{EffectChoice, ModelChoice};
+
 use crate::{
     gpu::{GpuEffect, GpuProcessor},
-    model::Matting,
+    model::{self, Matting},
     pipeline::{self, Effect, GreenScreen, InputFormat, PlanarFrame, VerticalFlip},
 };
 
@@ -25,6 +27,26 @@ pub enum Effects {
 }
 
 impl Effects {
+    /// The effects for `effect`, loading the matting model if it needs one.
+    pub fn load(
+        effect: EffectChoice,
+        model: ModelChoice,
+        reuse: bool,
+        smoothing: f32,
+    ) -> Result<(Self, String), String> {
+        match effect {
+            EffectChoice::Flip => Ok((Self::Flip, "flip".into())),
+            EffectChoice::GreenScreen => {
+                let (matte, description) = model::load(model, smoothing)?;
+                let reuse_note = if reuse { ", reusing each matte for the next frame" } else { "" };
+                Ok((
+                    Self::GreenScreen(Matting::new(matte, reuse)),
+                    format!("green screen with {description}{reuse_note}"),
+                ))
+            }
+        }
+    }
+
     fn for_cpu(self) -> Vec<Box<dyn Effect>> {
         match self {
             Self::Flip => vec![Box::new(VerticalFlip)],
@@ -104,6 +126,22 @@ impl Processor {
             Some(gpu) => Self::on_gpu(gpu, effects),
             None => Self::cpu(effects),
         })
+    }
+
+    /// Replace the effects, e.g. to switch models.
+    pub fn set_effects(&mut self, effects: Effects) {
+        match &mut self.backend {
+            Backend::Cpu(cpu) => cpu.effects = effects.for_cpu(),
+            Backend::Gpu(gpu) => gpu.set_effects(effects.for_gpu()),
+        }
+    }
+
+    /// The matting model the effects run, if any, to change its settings.
+    pub fn matting_mut(&mut self) -> Option<&mut Matting> {
+        match &mut self.backend {
+            Backend::Cpu(cpu) => cpu.effects.iter_mut().find_map(|e| e.matting_mut()),
+            Backend::Gpu(gpu) => gpu.matting_mut(),
+        }
     }
 
     /// Forget effects' temporal state, e.g. after switching cameras.
@@ -436,7 +474,8 @@ mod tests {
             .expect("testimage.jpg");
         let header = turbojpeg::read_header(&jpg).unwrap();
         let (w, h) = (header.width, header.height);
-        let matte = || Effects::GreenScreen(Matting::new(crate::model::from_env().unwrap().0, false));
+        let choice = model::choice_from_env().unwrap();
+        let matte = || Effects::GreenScreen(Matting::new(model::load(choice, 0.5).unwrap().0, false));
         let mut outputs = Vec::new();
         for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
             let mut dst = vec![0u8; w * 2 * h];

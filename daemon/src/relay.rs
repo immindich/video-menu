@@ -38,11 +38,12 @@ use spa::{
     utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, SpaTypes, result::SpaResult},
 };
 
+use video_menu_protocol::{EffectChoice, ModelChoice};
+
 use crate::{
-    formats::{self, CameraMode, serialize},
-    formats::CaptureFormat,
+    formats::{self, CameraMode, CaptureFormat, serialize},
     pipeline::InputFormat,
-    processor::{FrameFormat, Processor},
+    processor::{Effects, FrameFormat, Processor},
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -118,6 +119,36 @@ impl Timing {
 /// application is streaming from `output`. The relay may have no camera
 /// selected, in which case `output` advertises generic formats and produces
 /// no frames; see [`set_camera`](Self::set_camera).
+/// Settings that can change while the relay runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    pub effect: EffectChoice,
+    pub model: ModelChoice,
+    /// Composite each frame with the previous frame's matte; see
+    /// [`crate::model::Matting`].
+    pub reuse_matte: bool,
+    /// Temporal smoothing of the selfie model's mask, 0..1.
+    pub selfie_smoothing: f32,
+}
+
+impl Settings {
+    /// The starting settings, from `VIDEO_MENU_EFFECT`,
+    /// `VIDEO_MENU_MATTE_MODEL`, `VIDEO_MENU_REUSE_MATTE` and
+    /// `VIDEO_MENU_SELFIE_SMOOTHING`.
+    pub fn from_env() -> Result<Self, String> {
+        let effect = match std::env::var("VIDEO_MENU_EFFECT") {
+            Ok(s) if !s.is_empty() => s.parse()?,
+            _ => EffectChoice::default(),
+        };
+        Ok(Self {
+            effect,
+            model: crate::model::choice_from_env()?,
+            reuse_matte: std::env::var("VIDEO_MENU_REUSE_MATTE").as_deref() == Ok("1"),
+            selfie_smoothing: crate::model::smoothing_from_env()?,
+        })
+    }
+}
+
 pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
@@ -126,6 +157,8 @@ pub struct CameraRelay {
     processor: RefCell<Processor>,
     /// Name of the video source being relayed, if any.
     camera: RefCell<Option<String>>,
+    /// The effect settings `processor` was set up with.
+    settings: RefCell<Settings>,
     /// Live list of video sources the relay could capture from.
     sources: VideoSources,
     /// Origin for fallback timestamps when the camera provides none.
@@ -146,6 +179,7 @@ impl CameraRelay {
         core: &CoreRc,
         sources: VideoSources,
         processor: Processor,
+        settings: Settings,
     ) -> Result<Rc<Self>, pw::Error> {
         let input = StreamRc::new(
             core.clone(),
@@ -176,6 +210,7 @@ impl CameraRelay {
             state: RefCell::default(),
             processor: RefCell::new(processor),
             camera: RefCell::default(),
+            settings: RefCell::new(settings),
             sources,
             start: Instant::now(),
         }))
@@ -242,6 +277,64 @@ impl CameraRelay {
             .and_then(|name| self.sources.formats(&name))
             .map(|pods| formats::camera_modes(&pods))
             .unwrap_or_default()
+    }
+
+    /// The current effect settings.
+    pub fn settings(&self) -> Settings {
+        *self.settings.borrow()
+    }
+
+    /// Switch the effect, loading the matting model if it needs one.
+    pub fn set_effect(&self, effect: EffectChoice) -> Result<(), String> {
+        self.apply(Settings { effect, ..self.settings() })
+    }
+
+    /// Switch the matting model. Takes effect at once with the green screen,
+    /// and when it is next selected otherwise.
+    pub fn set_model(&self, model: ModelChoice) -> Result<(), String> {
+        self.apply(Settings { model, ..self.settings() })
+    }
+
+    /// Turn reusing the previous frame's matte on or off.
+    pub fn set_reuse_matte(&self, reuse: bool) {
+        if let Some(matting) = self.processor.borrow_mut().matting_mut() {
+            matting.set_reuse(reuse);
+        }
+        self.settings.borrow_mut().reuse_matte = reuse;
+        eprintln!("relay: matte reuse {}", if reuse { "on" } else { "off" });
+    }
+
+    /// Change the selfie model's temporal smoothing (0..1).
+    pub fn set_selfie_smoothing(&self, strength: f32) -> Result<(), String> {
+        if !(0.0..1.0).contains(&strength) {
+            return Err(format!("selfie smoothing must be in 0..1, not {strength}"));
+        }
+        if let Some(matting) = self.processor.borrow_mut().matting_mut() {
+            matting.set_smoothing(strength);
+        }
+        self.settings.borrow_mut().selfie_smoothing = strength;
+        Ok(())
+    }
+
+    /// Rebuild the effects if `new` needs different ones, then record it.
+    fn apply(&self, new: Settings) -> Result<(), String> {
+        let old = self.settings();
+        let rebuild = new.effect != old.effect
+            || (new.effect == EffectChoice::GreenScreen && new.model != old.model);
+        if rebuild {
+            // Load before touching the running pipeline, so a failure (e.g. a
+            // missing model file) leaves it as it was.
+            let (effects, description) =
+                Effects::load(new.effect, new.model, new.reuse_matte, new.selfie_smoothing)?;
+            self.stop_capture();
+            self.processor.borrow_mut().set_effects(effects);
+            eprintln!("relay: now {description}");
+        }
+        *self.settings.borrow_mut() = new;
+        if rebuild {
+            self.resume_capture();
+        }
+        Ok(())
     }
 
     /// Point the capture stream at `target`. Takes effect on the next connect.

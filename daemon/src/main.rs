@@ -47,9 +47,8 @@ use std::error::Error;
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use model::Matting;
 use processor::{Effects, Processor};
-use relay::{CameraRelay, OUTPUT_NODE_NAME, VideoSources, roundtrip};
+use relay::{CameraRelay, OUTPUT_NODE_NAME, Settings, VideoSources, roundtrip};
 
 fn main() -> Result<(), Box<dyn Error>> {
     pw::init();
@@ -65,22 +64,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     roundtrip(&mainloop, &core)?; // their formats
     let initial = sources.select(target.as_deref())?;
 
-    let effects = match std::env::var("VIDEO_MENU_EFFECT").as_deref() {
-        Ok("flip") => Effects::Flip,
-        Ok("green") | Ok("") | Err(_) => {
-            let (matte, description) = model::from_env()?;
-            let reuse = std::env::var("VIDEO_MENU_REUSE_MATTE").as_deref() == Ok("1");
-            eprintln!("matting with {description}");
-            if reuse {
-                eprintln!("reusing each frame's matte for the next frame");
-            }
-            Effects::GreenScreen(Matting::new(matte, reuse))
-        }
-        Ok(other) => return Err(format!("VIDEO_MENU_EFFECT must be green or flip, not {other:?}").into()),
-    };
+    let settings = Settings::from_env()?;
+    let (effects, description) = Effects::load(
+        settings.effect,
+        settings.model,
+        settings.reuse_matte,
+        settings.selfie_smoothing,
+    )?;
+    eprintln!("effect: {description}");
     let processor = Processor::from_env(effects)?;
     eprintln!("processing frames on the {}", processor.describe());
-    let relay = CameraRelay::new(&core, sources, processor)?;
+    let relay = CameraRelay::new(&core, sources, processor, settings)?;
     let _listeners = relay.listen()?;
     match &initial {
         Some(camera) => relay.set_camera(Some(camera))?,

@@ -27,6 +27,7 @@
 use std::time::{Duration, Instant};
 
 use half::{f16, slice::HalfFloatSliceExt};
+use video_menu_protocol::ModelChoice;
 use openvino::{
     Core, DeviceType, ElementType, InferRequest, PartialShape, RwPropertyKey, Shape, Tensor,
 };
@@ -83,6 +84,10 @@ pub trait Matte {
     /// Forget temporal state, e.g. after switching cameras. Must not be
     /// called while a frame is in flight.
     fn reset(&mut self);
+
+    /// Change how strongly the result is smoothed over time, for models that
+    /// do that (0 disables it). Others ignore it.
+    fn set_smoothing(&mut self, _strength: f32) {}
 }
 
 /// Runs a [`Matte`] for each frame, either in step with the frames or one
@@ -107,6 +112,25 @@ impl Matting {
     /// The resolution the model works at.
     pub fn size(&self) -> (usize, usize) {
         self.matte.size()
+    }
+
+    /// Switch between waiting for each frame's own result and reusing the
+    /// previous frame's. Turning reuse off waits for any frame in flight and
+    /// starts over, so the next frame gets its own result.
+    pub fn set_reuse(&mut self, reuse: bool) {
+        if reuse == self.reuse {
+            return;
+        }
+        if std::mem::take(&mut self.pending) {
+            let _ = self.matte.finish();
+        }
+        self.ready = false;
+        self.reuse = reuse;
+    }
+
+    /// See [`Matte::set_smoothing`].
+    pub fn set_smoothing(&mut self, strength: f32) {
+        self.matte.set_smoothing(strength);
     }
 
     /// The coefficients to composite the frame whose model input is `src`
@@ -157,33 +181,47 @@ impl Drop for Matting {
     }
 }
 
-/// Which model to use, from `VIDEO_MENU_MATTE_MODEL`: `rvm` (the default) or
-/// `selfie`. Returns the model and a description for the log.
-pub fn from_env() -> Result<(Box<dyn Matte>, String), String> {
+/// The model to start with, from `VIDEO_MENU_MATTE_MODEL` (`rvm`, the
+/// default, or `selfie`).
+pub fn choice_from_env() -> Result<ModelChoice, String> {
+    match std::env::var("VIDEO_MENU_MATTE_MODEL") {
+        Ok(s) if !s.is_empty() => s.parse(),
+        _ => Ok(ModelChoice::default()),
+    }
+}
+
+/// The selfie model's starting temporal smoothing, from
+/// `VIDEO_MENU_SELFIE_SMOOTHING` (0..1, default [`SELFIE_SMOOTHING`]).
+pub fn smoothing_from_env() -> Result<f32, String> {
+    match std::env::var("VIDEO_MENU_SELFIE_SMOOTHING") {
+        Ok(s) => s
+            .parse::<f32>()
+            .ok()
+            .filter(|v| (0.0..1.0).contains(v))
+            .ok_or_else(|| format!("VIDEO_MENU_SELFIE_SMOOTHING must be in 0..1, not {s:?}")),
+        Err(_) => Ok(SELFIE_SMOOTHING),
+    }
+}
+
+/// Load `choice` from its usual location (see [`find_model`]), on the device
+/// named by `VIDEO_MENU_MODEL_DEVICE` (default `NPU`). `smoothing` applies to
+/// the selfie model. Returns the model and a description for the log.
+pub fn load(choice: ModelChoice, smoothing: f32) -> Result<(Box<dyn Matte>, String), String> {
     let device = std::env::var("VIDEO_MENU_MODEL_DEVICE").unwrap_or_else(|_| "NPU".into());
-    match std::env::var("VIDEO_MENU_MATTE_MODEL").as_deref() {
-        Ok("rvm") | Ok("") | Err(_) => {
+    match choice {
+        ModelChoice::Rvm => {
             let path = find_model("VIDEO_MENU_MODEL", RVM_FILE, "nix build .#rvm-model")?;
             let matte = RvmMatte::load(&path, &device)?;
             Ok((Box::new(matte), format!("RVM on the {device}")))
         }
-        Ok("selfie") => {
+        ModelChoice::Selfie => {
             let path = find_model("VIDEO_MENU_SELFIE_MODEL", SELFIE_FILE, "nix build .#selfie-model")?;
-            let smoothing = match std::env::var("VIDEO_MENU_SELFIE_SMOOTHING") {
-                Ok(s) => s
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|v| (0.0..1.0).contains(v))
-                    .ok_or_else(|| format!("VIDEO_MENU_SELFIE_SMOOTHING must be in 0..1, not {s:?}"))?,
-                Err(_) => SELFIE_SMOOTHING,
-            };
             let matte = SelfieMatte::load(&path, &device, smoothing)?;
             Ok((
                 Box::new(matte),
                 format!("MediaPipe selfie (landscape) on the {device}, smoothing {smoothing}"),
             ))
         }
-        Ok(other) => Err(format!("VIDEO_MENU_MATTE_MODEL must be rvm or selfie, not {other:?}")),
     }
 }
 
@@ -364,6 +402,10 @@ impl Matte for SelfieMatte {
     fn reset(&mut self) {
         self.smoother.reset();
     }
+
+    fn set_smoothing(&mut self, strength: f32) {
+        self.smoother.set_strength(strength);
+    }
 }
 
 /// Smooths a single-frame model's mask over time: each new mask is blended
@@ -423,6 +465,11 @@ impl TemporalSmoother {
     /// Forget the previous frame, e.g. after switching cameras.
     pub fn reset(&mut self) {
         self.has_prev = false;
+    }
+
+    /// Change the weight given to the previous mask (0 disables smoothing).
+    pub fn set_strength(&mut self, strength: f32) {
+        self.strength = strength;
     }
 }
 
@@ -838,6 +885,31 @@ mod tests {
         sm.reset();
         let mut mask = vec![0.0; w * h];
         sm.apply(&vec![0.8; w * h], &mut mask);
+        assert!(mask.iter().all(|&m| m == 0.0));
+    }
+
+    #[test]
+    fn turning_reuse_off_finishes_the_frame_in_flight() {
+        let mut m = Matting::new(Box::<FakeMatte>::default(), true);
+        let (f1, f2) = (frame(0.1), frame(0.5));
+        a_of(&mut m, &f1); // leaves f1 in flight
+        m.set_reuse(false); // FakeMatte asserts if a frame is started twice
+        assert_eq!(a_of(&mut m, &f2), coefficients_for(&f2, N).0);
+        // And back on: the first frame waits for its own result again.
+        m.set_reuse(true);
+        assert_eq!(a_of(&mut m, &f1), coefficients_for(&f1, N).0);
+    }
+
+    #[test]
+    fn smoothing_strength_zero_passes_masks_through() {
+        let (w, h) = (8, 4);
+        let guide = vec![0.5; w * h];
+        let mut sm = TemporalSmoother::new(w, h, 0.8, 0.08);
+        let mut mask = vec![1.0; w * h];
+        sm.apply(&guide, &mut mask);
+        sm.set_strength(0.0);
+        let mut mask = vec![0.0; w * h];
+        sm.apply(&guide, &mut mask);
         assert!(mask.iter().all(|&m| m == 0.0));
     }
 }

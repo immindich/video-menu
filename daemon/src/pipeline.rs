@@ -183,6 +183,12 @@ pub trait Effect {
 
     /// Forget any temporal state, e.g. after switching cameras.
     fn reset(&mut self) {}
+
+    /// The matting model this effect runs, if any, so its settings can be
+    /// changed in place.
+    fn matting_mut(&mut self) -> Option<&mut Matting> {
+        None
+    }
 }
 
 /// Flips the frame upside down. Used in tests.
@@ -312,6 +318,10 @@ impl Effect for GreenScreen {
 
     fn reset(&mut self) {
         self.matte.reset();
+    }
+
+    fn matting_mut(&mut self) -> Option<&mut Matting> {
+        Some(&mut self.matte)
     }
 }
 

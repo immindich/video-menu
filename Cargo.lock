@@ -1396,8 +1396,13 @@ dependencies = [
  "pipewire",
  "pollster",
  "turbojpeg",
+ "video-menu-protocol",
  "wgpu",
 ]
+
+[[package]]
+name = "video-menu-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "wasm-bindgen"

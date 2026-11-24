@@ -225,6 +225,14 @@ impl GpuProcessor {
         &self.adapter_name
     }
 
+    /// The matting model the effects run, if any.
+    pub fn matting_mut(&mut self) -> Option<&mut Matting> {
+        self.effects.iter_mut().find_map(|e| match e {
+            GpuEffect::GreenScreen(matte) => Some(matte),
+            GpuEffect::VerticalFlip => None,
+        })
+    }
+
     /// Forget effects' temporal state, e.g. after switching cameras.
     pub fn reset(&mut self) {
         for effect in &mut self.effects {

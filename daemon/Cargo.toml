@@ -10,4 +10,5 @@ openvino = "0.11.1"
 pipewire = { version = "0.10.1", features = ["v0_3_34"] }
 pollster = "1.0.3"
 turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config"] }
+video-menu-protocol = { version = "0.1.0", path = "../protocol" }
 wgpu = "30.0.2"
