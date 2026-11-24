@@ -77,7 +77,9 @@ pub fn camera_modes(pods: &[Vec<u8>]) -> Vec<CameraMode> {
 /// the camera can supply, largest first, at the rates it supports there.
 pub fn output_formats(modes: &[CameraMode]) -> Vec<Vec<u8>> {
     let mut sizes: Vec<(u32, u32)> = modes.iter().map(|m| (m.width, m.height)).collect();
-    sizes.sort_by_key(|&(w, h)| std::cmp::Reverse(w as u64 * h as u64));
+    // Sizes with equal area (e.g. 960x640 and 1024x600) must still end up
+    // adjacent to their duplicates, so break ties on the size itself.
+    sizes.sort_by_key(|&(w, h)| std::cmp::Reverse((w as u64 * h as u64, w, h)));
     sizes.dedup();
     sizes
         .into_iter()
@@ -356,6 +358,15 @@ mod tests {
                 mode(VideoFormat::YUY2, 640, 360, Some(&[(60, 1), (30, 1)])),
             ]
         );
+    }
+
+    #[test]
+    fn output_formats_dedup_equal_area_sizes() {
+        let modes: Vec<CameraMode> = [VideoFormat::RGBx, VideoFormat::BGRx]
+            .into_iter()
+            .flat_map(|f| [mode(f, 960, 640, None), mode(f, 1024, 600, None)])
+            .collect();
+        assert_eq!(output_formats(&modes).len(), 2);
     }
 
     #[test]
