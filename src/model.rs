@@ -5,10 +5,17 @@
 //! channels each: foreground residual R, G, B and alpha) at that resolution.
 //! The caller upsamples them to the frame's resolution and computes
 //! `A * [R, G, B, gray] + b` there; see [`crate::pipeline::GreenScreen`] and
-//! `green_screen` in `pipeline.wgsl`. The model is [`RvmMatte`]:
-//! RobustVideoMatting without its full-resolution refiner stage (see
-//! `tools/split_refiner.py`). The network itself produces `A` and `b` (a
-//! learned guided filter) and carries recurrent state between frames.
+//! `green_screen` in `pipeline.wgsl`. Two models are available:
+//!
+//! - [`RvmMatte`]: RobustVideoMatting without its full-resolution refiner
+//!   stage (see `tools/split_refiner.py`). The network itself produces `A`
+//!   and `b` (a learned guided filter) and carries recurrent state between
+//!   frames. GPL-3.0.
+//! - [`SelfieMatte`]: MediaPipe's selfie segmenter (landscape), converted
+//!   with `tools/convert_selfie.py`. It outputs only a 256x144 person mask; a
+//!   classic guided filter, guided by the frame's brightness, turns that into
+//!   `A` and `b`, and the foreground colour is taken to be the frame's own.
+//!   Single-frame, very small (~250K weights); Apache-2.0.
 //!
 //! [`Matting`] schedules the model. It can either run it on each frame
 //! before that frame is composited, or reuse the previous frame's result
@@ -17,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 use openvino::{
     Core, DeviceType, ElementType, InferRequest, PartialShape, RwPropertyKey, Shape, Tensor,
 };
@@ -25,9 +32,19 @@ use openvino::{
 /// Resolution RVM runs at.
 pub const RVM_SIZE: (usize, usize) = (480, 270);
 
+/// Resolution of MediaPipe's landscape selfie segmenter.
+pub const SELFIE_SIZE: (usize, usize) = (256, 144);
+
 /// File names looked for in the current directory when the model's path
 /// variable is unset or wrong.
 const RVM_FILE: &str = "rvm_mobilenetv3_fp16_core.onnx";
+const SELFIE_FILE: &str = "selfie_segmenter_landscape.xml";
+
+/// Guided filter applied to alpha-only models' masks: window radius (at
+/// model resolution) and regularisation. Smaller `eps` follows the frame's
+/// edges more closely, larger smooths more.
+const GUIDED_RADIUS: usize = 2;
+const GUIDED_EPS: f32 = 1e-3;
 
 /// Recurrent state tensors: name prefix, channels, and downscale factor
 /// relative to the model resolution (stride-2 convolutions round up).
@@ -130,8 +147,8 @@ impl Drop for Matting {
     }
 }
 
-/// Which model to use, from `VIDEO_MENU_MATTE_MODEL` (currently only `rvm`,
-/// the default). Returns the model and a description for the log.
+/// Which model to use, from `VIDEO_MENU_MATTE_MODEL`: `rvm` (the default) or
+/// `selfie`. Returns the model and a description for the log.
 pub fn from_env() -> Result<(Box<dyn Matte>, String), String> {
     let device = std::env::var("VIDEO_MENU_MODEL_DEVICE").unwrap_or_else(|_| "NPU".into());
     match std::env::var("VIDEO_MENU_MATTE_MODEL").as_deref() {
@@ -140,7 +157,12 @@ pub fn from_env() -> Result<(Box<dyn Matte>, String), String> {
             let matte = RvmMatte::load(&path, &device)?;
             Ok((Box::new(matte), format!("RVM on the {device}")))
         }
-        Ok(other) => Err(format!("VIDEO_MENU_MATTE_MODEL must be rvm, not {other:?}")),
+        Ok("selfie") => {
+            let path = find_model("VIDEO_MENU_SELFIE_MODEL", SELFIE_FILE, "nix build .#selfie-model")?;
+            let matte = SelfieMatte::load(&path, &device)?;
+            Ok((Box::new(matte), format!("MediaPipe selfie (landscape) on the {device}")))
+        }
+        Ok(other) => Err(format!("VIDEO_MENU_MATTE_MODEL must be rvm or selfie, not {other:?}")),
     }
 }
 
@@ -230,6 +252,217 @@ impl Matte for RvmMatte {
             if let Ok(data) = state.get_raw_data_mut() {
                 data.fill(0);
             }
+        }
+    }
+}
+
+/// MediaPipe's selfie segmenter on OpenVINO, with a guided filter to make
+/// refiner coefficients from its mask. The converted model takes the frame
+/// as f16 planes directly (see `tools/convert_selfie.py`).
+pub struct SelfieMatte {
+    request: InferRequest,
+    input: Tensor,
+    /// Brightness of the frame in flight, which guides the filter.
+    guide: Vec<f32>,
+    alpha: Vec<f32>,
+    filter: GuidedFilter,
+    a: Vec<f16>,
+    b: Vec<f16>,
+}
+
+impl SelfieMatte {
+    pub fn load(path: &str, device: &str) -> Result<Self, String> {
+        let (w, h) = SELFIE_SIZE;
+        let shape = vec![1, 3, h as i64, w as i64];
+        let request = compile(path, device, &[("input_1".into(), shape.clone())])?;
+        let input = zero_tensor(ElementType::F16, &shape)?;
+        let pixels = w * h;
+        Ok(Self {
+            request,
+            input,
+            guide: vec![0.0; pixels],
+            alpha: vec![0.0; pixels],
+            filter: GuidedFilter::new(w, h, GUIDED_RADIUS, GUIDED_EPS),
+            a: vec![f16::ZERO; 4 * pixels],
+            b: vec![f16::ZERO; 4 * pixels],
+        })
+    }
+
+    fn start_inner(&mut self, src: &[f16]) -> Result<(), openvino::InferenceError> {
+        let n = SELFIE_SIZE.0 * SELFIE_SIZE.1;
+        self.input
+            .get_raw_data_mut()?
+            .copy_from_slice(bytemuck::cast_slice(src));
+        for (i, g) in self.guide.iter_mut().enumerate() {
+            *g = (src[i].to_f32() + src[n + i].to_f32() + src[2 * n + i].to_f32()) * (1.0 / 3.0);
+        }
+        self.request.set_tensor("input_1", &self.input)?;
+        self.request.infer_async()
+    }
+
+    fn finish_inner(&mut self) -> Result<(), openvino::InferenceError> {
+        wait(&mut self.request)?;
+        // [1, 144, 256, 1]: one channel, so the same layout as a plane.
+        let out = self.request.get_output_tensor_by_index(0)?;
+        self.alpha.copy_from_slice(bytemuck::cast_slice(out.get_raw_data()?));
+        self.filter.apply(&self.guide, &self.alpha);
+        // The foreground colour is the frame's own (zero residual), and alpha
+        // follows the guide: alpha = A * gray + b, which the refine step
+        // evaluates per pixel at full resolution.
+        let n = SELFIE_SIZE.0 * SELFIE_SIZE.1;
+        self.a[..3 * n].fill(f16::ZERO);
+        self.b[..3 * n].fill(f16::ZERO);
+        self.a[3 * n..].convert_from_f32_slice(&self.filter.a);
+        self.b[3 * n..].convert_from_f32_slice(&self.filter.b);
+        Ok(())
+    }
+}
+
+impl Matte for SelfieMatte {
+    fn size(&self) -> (usize, usize) {
+        SELFIE_SIZE
+    }
+
+    fn start(&mut self, src: &[f16]) -> Result<(), String> {
+        check_input(src, SELFIE_SIZE)?;
+        self.start_inner(src).map_err(|e| format!("starting inference: {e}"))
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.finish_inner().map_err(|e| format!("inference failed: {e}"))
+    }
+
+    fn coefficients(&self) -> (&[f16], &[f16]) {
+        (&self.a, &self.b)
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Guided filter (He et al.): smoothed linear coefficients `(a, b)` such
+/// that `a * guide + b` approximates `p` while following the guide's edges.
+/// Computing them at low resolution and applying them to a full-resolution
+/// guide is the "fast guided filter", which is exactly what the refine step
+/// does. Holds its scratch buffers so per-frame use doesn't allocate.
+pub struct GuidedFilter {
+    w: usize,
+    h: usize,
+    r: usize,
+    eps: f32,
+    mean_i: Vec<f32>,
+    mean_p: Vec<f32>,
+    mean_ip: Vec<f32>,
+    mean_ii: Vec<f32>,
+    tmp: Vec<f32>,
+    rows: Vec<f32>,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+}
+
+impl GuidedFilter {
+    pub fn new(w: usize, h: usize, r: usize, eps: f32) -> Self {
+        let n = w * h;
+        let buf = || vec![0f32; n];
+        Self {
+            w,
+            h,
+            r,
+            eps,
+            mean_i: buf(),
+            mean_p: buf(),
+            mean_ip: buf(),
+            mean_ii: buf(),
+            tmp: buf(),
+            rows: buf(),
+            a: buf(),
+            b: buf(),
+        }
+    }
+
+    /// Filter `p` guided by `guide` (both `w`x`h`); the result is in
+    /// [`a`](Self::a) and [`b`](Self::b).
+    pub fn apply(&mut self, guide: &[f32], p: &[f32]) {
+        let (w, h, r) = (self.w, self.h, self.r);
+        box_mean(guide, w, h, r, &mut self.rows, &mut self.mean_i);
+        box_mean(p, w, h, r, &mut self.rows, &mut self.mean_p);
+        for ((t, g), v) in self.tmp.iter_mut().zip(guide).zip(p) {
+            *t = g * v;
+        }
+        box_mean(&self.tmp, w, h, r, &mut self.rows, &mut self.mean_ip);
+        for (t, g) in self.tmp.iter_mut().zip(guide) {
+            *t = g * g;
+        }
+        box_mean(&self.tmp, w, h, r, &mut self.rows, &mut self.mean_ii);
+        for i in 0..w * h {
+            let (mi, mp) = (self.mean_i[i], self.mean_p[i]);
+            let cov = self.mean_ip[i] - mi * mp;
+            let var = self.mean_ii[i] - mi * mi;
+            let a = cov / (var + self.eps);
+            self.mean_ip[i] = a; // reuse as scratch for a and b
+            self.mean_ii[i] = mp - a * mi;
+        }
+        box_mean(&self.mean_ip, w, h, r, &mut self.rows, &mut self.a);
+        box_mean(&self.mean_ii, w, h, r, &mut self.rows, &mut self.b);
+    }
+}
+
+/// Convenience wrapper allocating a [`GuidedFilter`] for one use.
+#[cfg(test)]
+pub fn guided_filter(
+    guide: &[f32],
+    p: &[f32],
+    w: usize,
+    h: usize,
+    r: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut f = GuidedFilter::new(w, h, r, eps);
+    f.apply(guide, p);
+    (f.a, f.b)
+}
+
+/// Mean of `x` (`w`x`h`) over a (2r+1)x(2r+1) window into `out`, shrinking
+/// the window at the borders. `rows` is scratch of the same size. The
+/// vertical pass adds and removes whole rows, so it runs over contiguous
+/// memory and vectorises.
+fn box_mean(x: &[f32], w: usize, h: usize, r: usize, rows: &mut [f32], out: &mut [f32]) {
+    // Horizontal: running sum along each row.
+    for (src, dst) in x.chunks_exact(w).zip(rows.chunks_exact_mut(w)) {
+        let mut sum: f32 = src[..r.min(w - 1) + 1].iter().sum();
+        let (mut lo, mut hi) = (0usize, r.min(w - 1) + 1); // window [lo, hi)
+        for (i, d) in dst.iter_mut().enumerate() {
+            let (want_lo, want_hi) = (i.saturating_sub(r), (i + r + 1).min(w));
+            while hi < want_hi {
+                sum += src[hi];
+                hi += 1;
+            }
+            while lo < want_lo {
+                sum -= src[lo];
+                lo += 1;
+            }
+            *d = sum / (hi - lo) as f32;
+        }
+    }
+    // Vertical: keep a running sum of rows, writing each output row from it.
+    let mut acc = vec![0f32; w];
+    let (mut lo, mut hi) = (0usize, 0usize); // rows [lo, hi)
+    for y in 0..h {
+        let (want_lo, want_hi) = (y.saturating_sub(r), (y + r + 1).min(h));
+        while hi < want_hi {
+            for (a, v) in acc.iter_mut().zip(&rows[hi * w..][..w]) {
+                *a += v;
+            }
+            hi += 1;
+        }
+        while lo < want_lo {
+            for (a, v) in acc.iter_mut().zip(&rows[lo * w..][..w]) {
+                *a -= v;
+            }
+            lo += 1;
+        }
+        let inv = 1.0 / (hi - lo) as f32;
+        for (o, a) in out[y * w..][..w].iter_mut().zip(&acc) {
+            *o = a * inv;
         }
     }
 }
@@ -453,5 +686,35 @@ mod tests {
         m.reset();
         assert_eq!(a_of(&mut m, &f1), coefficients_for(&f1, N).0);
     }
-}
 
+    #[test]
+    fn box_mean_shrinks_at_borders() {
+        // 5x1, radius 1: windows [0,1], [0,2], [1,3], [2,4], [3,4].
+        let x = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let mean = |w, h| {
+            let (mut rows, mut out) = ([0.0; 5], [0.0; 5]);
+            box_mean(&x, w, h, 1, &mut rows, &mut out);
+            out
+        };
+        assert_eq!(mean(5, 1), [1.5, 2.0, 3.0, 4.0, 4.5]);
+        // Vertical pass on a 1x5 column gives the same.
+        assert_eq!(mean(1, 5), [1.5, 2.0, 3.0, 4.0, 4.5]);
+    }
+
+    #[test]
+    fn guided_filter_reproduces_linear_inputs() {
+        let (w, h) = (16, 12);
+        let guide: Vec<f32> = (0..w * h).map(|i| ((i % w) as f32 / w as f32) * 0.8 + 0.1).collect();
+        // A constant passes through with no dependence on the guide.
+        let (a, b) = guided_filter(&guide, &vec![0.7; w * h], w, h, 2, 1e-3);
+        assert!(a.iter().all(|v| v.abs() < 1e-4) && b.iter().all(|v| (v - 0.7).abs() < 1e-4));
+        // An input that is a linear function of the guide is followed exactly
+        // (up to the small regularisation).
+        let p: Vec<f32> = guide.iter().map(|g| 0.5 * g + 0.2).collect();
+        let (a, b) = guided_filter(&guide, &p, w, h, 2, 1e-6);
+        for i in 0..w * h {
+            let q = a[i] * guide[i] + b[i];
+            assert!((q - p[i]).abs() < 1e-3, "pixel {i}: {q} vs {}", p[i]);
+        }
+    }
+}

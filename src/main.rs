@@ -17,8 +17,12 @@
 //!
 //! Other settings:
 //! - `VIDEO_MENU_EFFECT=flip` flips frames instead of running the model.
-//! - `VIDEO_MENU_MODEL` is the model file; if it is unset or doesn't exist,
-//!   `rvm_mobilenetv3_fp16_core.onnx` in the current directory is used.
+//! - `VIDEO_MENU_MATTE_MODEL` chooses the matting model: `rvm` (default,
+//!   GPL-3.0) or `selfie` (MediaPipe's selfie segmenter, Apache-2.0; see
+//!   `model.rs`).
+//! - `VIDEO_MENU_MODEL` / `VIDEO_MENU_SELFIE_MODEL` are the model files; if
+//!   unset or missing, `rvm_mobilenetv3_fp16_core.onnx` /
+//!   `selfie_segmenter_landscape.xml` in the current directory are used.
 //! - `VIDEO_MENU_MODEL_DEVICE` is the device the model runs on (default NPU).
 //! - `VIDEO_MENU_NPU_TURBO=1` trades CPU time for slightly lower model
 //!   latency when the camera is slow (see `model.rs`).
