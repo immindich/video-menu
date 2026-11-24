@@ -20,6 +20,9 @@
 //! - `VIDEO_MENU_MATTE_MODEL` chooses the matting model: `rvm` (default,
 //!   GPL-3.0) or `selfie` (MediaPipe's selfie segmenter, Apache-2.0; see
 //!   `model.rs`).
+//! - `VIDEO_MENU_SELFIE_SMOOTHING` (0..1, default 0.5) is how strongly the
+//!   selfie model's mask is smoothed over time where the image is still; 0
+//!   disables it.
 //! - `VIDEO_MENU_MODEL` / `VIDEO_MENU_SELFIE_MODEL` are the model files; if
 //!   unset or missing, `rvm_mobilenetv3_fp16_core.onnx` /
 //!   `selfie_segmenter_landscape.xml` in the current directory are used.

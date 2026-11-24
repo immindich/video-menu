@@ -15,7 +15,9 @@
 //!   with `tools/convert_selfie.py`. It outputs only a 256x144 person mask; a
 //!   classic guided filter, guided by the frame's brightness, turns that into
 //!   `A` and `b`, and the foreground colour is taken to be the frame's own.
-//!   Single-frame, very small (~250K weights); Apache-2.0.
+//!   It is single-frame, so its mask is smoothed over time where the image
+//!   is still ([`TemporalSmoother`]). Very small (~250K weights);
+//!   Apache-2.0.
 //!
 //! [`Matting`] schedules the model. It can either run it on each frame
 //! before that frame is composited, or reuse the previous frame's result
@@ -45,6 +47,14 @@ const SELFIE_FILE: &str = "selfie_segmenter_landscape.xml";
 /// edges more closely, larger smooths more.
 const GUIDED_RADIUS: usize = 2;
 const GUIDED_EPS: f32 = 1e-3;
+
+/// Default temporal smoothing for the selfie model's mask: the weight given
+/// to the previous frame's mask where the image hasn't changed.
+pub const SELFIE_SMOOTHING: f32 = 0.5;
+
+/// Brightness change (0..1, averaged over a small window) at which temporal
+/// smoothing fades out completely, so moving parts follow the new mask.
+const MOTION_THRESHOLD: f32 = 0.08;
 
 /// Recurrent state tensors: name prefix, channels, and downscale factor
 /// relative to the model resolution (stride-2 convolutions round up).
@@ -159,8 +169,19 @@ pub fn from_env() -> Result<(Box<dyn Matte>, String), String> {
         }
         Ok("selfie") => {
             let path = find_model("VIDEO_MENU_SELFIE_MODEL", SELFIE_FILE, "nix build .#selfie-model")?;
-            let matte = SelfieMatte::load(&path, &device)?;
-            Ok((Box::new(matte), format!("MediaPipe selfie (landscape) on the {device}")))
+            let smoothing = match std::env::var("VIDEO_MENU_SELFIE_SMOOTHING") {
+                Ok(s) => s
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| (0.0..1.0).contains(v))
+                    .ok_or_else(|| format!("VIDEO_MENU_SELFIE_SMOOTHING must be in 0..1, not {s:?}"))?,
+                Err(_) => SELFIE_SMOOTHING,
+            };
+            let matte = SelfieMatte::load(&path, &device, smoothing)?;
+            Ok((
+                Box::new(matte),
+                format!("MediaPipe selfie (landscape) on the {device}, smoothing {smoothing}"),
+            ))
         }
         Ok(other) => Err(format!("VIDEO_MENU_MATTE_MODEL must be rvm or selfie, not {other:?}")),
     }
@@ -265,13 +286,15 @@ pub struct SelfieMatte {
     /// Brightness of the frame in flight, which guides the filter.
     guide: Vec<f32>,
     alpha: Vec<f32>,
+    smoother: TemporalSmoother,
     filter: GuidedFilter,
     a: Vec<f16>,
     b: Vec<f16>,
 }
 
 impl SelfieMatte {
-    pub fn load(path: &str, device: &str) -> Result<Self, String> {
+    /// `smoothing` is the [`TemporalSmoother`] strength (0 disables it).
+    pub fn load(path: &str, device: &str, smoothing: f32) -> Result<Self, String> {
         let (w, h) = SELFIE_SIZE;
         let shape = vec![1, 3, h as i64, w as i64];
         let request = compile(path, device, &[("input_1".into(), shape.clone())])?;
@@ -282,6 +305,7 @@ impl SelfieMatte {
             input,
             guide: vec![0.0; pixels],
             alpha: vec![0.0; pixels],
+            smoother: TemporalSmoother::new(w, h, smoothing, MOTION_THRESHOLD),
             filter: GuidedFilter::new(w, h, GUIDED_RADIUS, GUIDED_EPS),
             a: vec![f16::ZERO; 4 * pixels],
             b: vec![f16::ZERO; 4 * pixels],
@@ -305,6 +329,7 @@ impl SelfieMatte {
         // [1, 144, 256, 1]: one channel, so the same layout as a plane.
         let out = self.request.get_output_tensor_by_index(0)?;
         self.alpha.copy_from_slice(bytemuck::cast_slice(out.get_raw_data()?));
+        self.smoother.apply(&self.guide, &mut self.alpha);
         self.filter.apply(&self.guide, &self.alpha);
         // The foreground colour is the frame's own (zero residual), and alpha
         // follows the guide: alpha = A * gray + b, which the refine step
@@ -336,7 +361,69 @@ impl Matte for SelfieMatte {
         (&self.a, &self.b)
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.smoother.reset();
+    }
+}
+
+/// Smooths a single-frame model's mask over time: each new mask is blended
+/// with the previous (smoothed) one, `mask = (1 - k) * new + k * previous`.
+/// `k` is `strength` where the image is still and falls to 0 where its
+/// brightness changed by `threshold` or more (averaged over a small window,
+/// so camera noise doesn't count as motion), so moving parts follow the new
+/// mask at once and only still areas are stabilised.
+pub struct TemporalSmoother {
+    w: usize,
+    h: usize,
+    strength: f32,
+    threshold: f32,
+    prev_mask: Vec<f32>,
+    prev_guide: Vec<f32>,
+    has_prev: bool,
+    diff: Vec<f32>,
+    motion: Vec<f32>,
+    rows: Vec<f32>,
+}
+
+impl TemporalSmoother {
+    pub fn new(w: usize, h: usize, strength: f32, threshold: f32) -> Self {
+        let buf = || vec![0f32; w * h];
+        Self {
+            w,
+            h,
+            strength,
+            threshold,
+            prev_mask: buf(),
+            prev_guide: buf(),
+            has_prev: false,
+            diff: buf(),
+            motion: buf(),
+            rows: buf(),
+        }
+    }
+
+    /// Smooth `mask` in place, given the frame's brightness `guide`.
+    pub fn apply(&mut self, guide: &[f32], mask: &mut [f32]) {
+        if self.strength > 0.0 && self.has_prev {
+            for ((d, g), p) in self.diff.iter_mut().zip(guide).zip(&self.prev_guide) {
+                *d = (g - p).abs();
+            }
+            box_mean(&self.diff, self.w, self.h, 2, &mut self.rows, &mut self.motion);
+            let still_scale = 1.0 / self.threshold;
+            for ((m, p), motion) in mask.iter_mut().zip(&self.prev_mask).zip(&self.motion) {
+                let k = self.strength * (1.0 - motion * still_scale).max(0.0);
+                *m += k * (p - *m);
+            }
+        }
+        self.prev_mask.copy_from_slice(mask);
+        self.prev_guide.copy_from_slice(guide);
+        self.has_prev = true;
+    }
+
+    /// Forget the previous frame, e.g. after switching cameras.
+    pub fn reset(&mut self) {
+        self.has_prev = false;
+    }
 }
 
 /// Guided filter (He et al.): smoothed linear coefficients `(a, b)` such
@@ -716,5 +803,41 @@ mod tests {
             let q = a[i] * guide[i] + b[i];
             assert!((q - p[i]).abs() < 1e-3, "pixel {i}: {q} vs {}", p[i]);
         }
+    }
+
+    #[test]
+    fn smoothing_damps_flicker_where_the_image_is_still() {
+        let (w, h) = (16, 8);
+        let guide = vec![0.5; w * h];
+        let mut sm = TemporalSmoother::new(w, h, 0.5, 0.08);
+        // A mask flickering between 0 and 1 on a still image.
+        let mut out = Vec::new();
+        for i in 0..10 {
+            let mut mask = vec![(i % 2) as f32; w * h];
+            sm.apply(&guide, &mut mask);
+            out.push(mask[0]);
+        }
+        // The first frame passes through; after that the swing shrinks from
+        // 1 to about 1/3 (the fixed point of the alternating blend).
+        assert_eq!(out[0], 0.0);
+        let swing = (out[9] - out[8]).abs();
+        assert!(swing < 0.4, "still flickering by {swing}");
+    }
+
+    #[test]
+    fn smoothing_follows_moving_parts_and_resets() {
+        let (w, h) = (16, 8);
+        let mut sm = TemporalSmoother::new(w, h, 0.9, 0.08);
+        let mut mask = vec![0.0; w * h];
+        sm.apply(&vec![0.2; w * h], &mut mask);
+        // The image changed a lot: the new mask is taken as is.
+        let mut mask = vec![1.0; w * h];
+        sm.apply(&vec![0.8; w * h], &mut mask);
+        assert!(mask.iter().all(|&m| m == 1.0));
+        // After a reset there is no previous frame to blend with.
+        sm.reset();
+        let mut mask = vec![0.0; w * h];
+        sm.apply(&vec![0.8; w * h], &mut mask);
+        assert!(mask.iter().all(|&m| m == 0.0));
     }
 }
