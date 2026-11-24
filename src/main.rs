@@ -11,6 +11,7 @@
 
 mod commands;
 mod model;
+mod pipeline;
 mod relay;
 
 use std::error::Error;
