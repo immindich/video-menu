@@ -3866,6 +3866,7 @@ name = "video-menu-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "pipewire",
  "video-menu-protocol",
  "zbus 6.5.0",
 ]

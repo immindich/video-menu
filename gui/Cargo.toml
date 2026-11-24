@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.37.0"
+pipewire = { version = "0.10.1", features = ["v0_3_34"] }
 video-menu-protocol = { version = "0.1.0", path = "../protocol" }
 zbus = "6.5.0"

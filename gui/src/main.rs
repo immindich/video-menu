@@ -1,13 +1,16 @@
 //! Settings and preview window for the video-menu daemon.
 //!
 //! Changes settings over D-Bus (see [`relay`]); the daemon must be running,
-//! and the window shows when it isn't.
+//! and the window shows when it isn't. `--preview` starts with the live
+//! preview on.
 
+mod preview;
 mod relay;
 
 use eframe::egui;
 use video_menu_protocol::{EffectChoice, ModelChoice};
 
+use preview::Preview;
 use relay::{Command, RelayClient, RelayState};
 
 fn main() -> eframe::Result {
@@ -24,7 +27,17 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let ctx = cc.egui_ctx.clone();
             let relay = RelayClient::start(move || ctx.request_repaint());
-            Ok(Box::new(App { relay, smoothing_edit: None }))
+            let preview = std::env::args().any(|a| a == "--preview").then(|| {
+                let ctx = cc.egui_ctx.clone();
+                Preview::start(move || ctx.request_repaint())
+            });
+            Ok(Box::new(App {
+                relay,
+                smoothing_edit: None,
+                preview,
+                texture: None,
+                frames: FrameCounter::default(),
+            }))
         }),
     )
 }
@@ -34,6 +47,31 @@ struct App {
     /// The smoothing slider's value while it is being dragged; sent to the
     /// daemon when the drag ends, rather than on every frame of it.
     smoothing_edit: Option<f64>,
+    /// The live preview, while it is switched on.
+    preview: Option<Preview>,
+    /// The latest preview frame on the GPU.
+    texture: Option<egui::TextureHandle>,
+    frames: FrameCounter,
+}
+
+/// Counts preview frames to show the rate they arrive at.
+#[derive(Default)]
+struct FrameCounter {
+    count: u32,
+    since: Option<std::time::Instant>,
+    fps: f64,
+}
+
+impl FrameCounter {
+    fn tick(&mut self) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.count += 1;
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            self.fps = self.count as f64 / elapsed;
+            *self = Self { fps: self.fps, ..Self::default() };
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -43,9 +81,7 @@ impl eframe::App for App {
             .resizable(false)
             .exact_size(300.0)
             .show(ui, |ui| self.relay_panel(ui, &state));
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.centered_and_justified(|ui| ui.label("Preview"));
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui, state.connected));
     }
 }
 
@@ -158,6 +194,56 @@ impl App {
         if !stats.backend.is_empty() {
             ui.add_space(4.0);
             ui.weak(format!("Processing on the {}", stats.backend));
+        }
+    }
+
+    fn preview_panel(&mut self, ui: &mut egui::Ui, connected: bool) {
+        ui.horizontal(|ui| {
+            let mut on = self.preview.is_some();
+            let toggle = ui
+                .add_enabled(connected, egui::Checkbox::new(&mut on, "Show preview"))
+                .on_hover_text("Reading the virtual camera keeps the real camera on, like any app using it");
+            if toggle.changed() {
+                if on {
+                    let ctx = ui.ctx().clone();
+                    self.preview = Some(Preview::start(move || ctx.request_repaint()));
+                } else if let Some(preview) = self.preview.take() {
+                    preview.stop();
+                    self.texture = None;
+                }
+            }
+            if self.preview.is_some() && self.texture.is_some() {
+                ui.weak(format!("{:.0} fps", self.frames.fps));
+            }
+        });
+        ui.separator();
+
+        let Some(preview) = &self.preview else {
+            ui.centered_and_justified(|ui| ui.weak("Preview off"));
+            return;
+        };
+        let (frame, status) = {
+            let mut shared = preview.shared.lock().unwrap();
+            (shared.frame.take(), shared.status.clone())
+        };
+        if let Some(frame) = frame {
+            self.frames.tick();
+            match &mut self.texture {
+                Some(texture) => texture.set(frame, egui::TextureOptions::LINEAR),
+                None => {
+                    self.texture = Some(ui.ctx().load_texture("preview", frame, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+        match &self.texture {
+            Some(texture) => {
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(ui.available_size()).maintain_aspect_ratio(true));
+                });
+            }
+            None => {
+                ui.centered_and_justified(|ui| ui.weak(status));
+            }
         }
     }
 }
