@@ -10,6 +10,7 @@
 //! with commands on stdin (see [`commands`]).
 
 mod commands;
+mod formats;
 mod model;
 mod pipeline;
 mod relay;
