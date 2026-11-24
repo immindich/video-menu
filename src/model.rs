@@ -19,9 +19,9 @@ pub const MODEL_WIDTH: usize = 480;
 pub const MODEL_HEIGHT: usize = 270;
 pub const MODEL_PIXELS: usize = MODEL_WIDTH * MODEL_HEIGHT;
 
-/// Default location of the split model, produced from RVM's ONNX export with
-/// `tools/split_refiner.py`.
-const DEFAULT_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/rvm_mobilenetv3_fp16_core.onnx");
+/// File name of the split model, produced from RVM's ONNX export with
+/// `tools/split_refiner.py` (or `nix build .#rvm-model`).
+const MODEL_FILE: &str = "rvm_mobilenetv3_fp16_core.onnx";
 
 /// Recurrent state tensors: name prefix, channels, and downscale factor
 /// relative to the model resolution (stride-2 convolutions round up).
@@ -54,19 +54,17 @@ pub struct RvmMatte {
 }
 
 impl RvmMatte {
-    /// Load and compile the model. `VIDEO_MENU_MODEL` overrides the model
-    /// path and `VIDEO_MENU_MODEL_DEVICE` the device (default `NPU`).
+    /// Load and compile the model from [`model_path`], on the device named
+    /// by `VIDEO_MENU_MODEL_DEVICE` (default `NPU`).
     pub fn from_env() -> Result<Self, String> {
-        let path = std::env::var("VIDEO_MENU_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+        let path = model_path()?;
         let device = std::env::var("VIDEO_MENU_MODEL_DEVICE").unwrap_or_else(|_| "NPU".into());
         Self::load(&path, &device)
     }
 
     pub fn load(path: &str, device: &str) -> Result<Self, String> {
         if !std::path::Path::new(path).exists() {
-            return Err(format!(
-                "model {path} not found; create it with tools/split_refiner.py"
-            ));
+            return Err(format!("model {path} not found"));
         }
         let mut core = Core::new().map_err(|e| format!("OpenVINO: {e}"))?;
         let dev: DeviceType = device.parse().map_err(|e| format!("device {device}: {e}"))?;
@@ -173,6 +171,24 @@ impl Matte for RvmMatte {
     fn last_time(&self) -> Duration {
         self.last
     }
+}
+
+/// Where to load the model from: `VIDEO_MENU_MODEL` if it is set and exists,
+/// otherwise `rvm_mobilenetv3_fp16_core.onnx` in the current directory.
+pub fn model_path() -> Result<String, String> {
+    if let Ok(path) = std::env::var("VIDEO_MENU_MODEL") {
+        if std::path::Path::new(&path).exists() {
+            return Ok(path);
+        }
+        eprintln!("model: VIDEO_MENU_MODEL={path} does not exist; trying ./{MODEL_FILE}");
+    }
+    if std::path::Path::new(MODEL_FILE).exists() {
+        return Ok(MODEL_FILE.into());
+    }
+    Err(format!(
+        "no matting model: set VIDEO_MENU_MODEL or put {MODEL_FILE} in the current \
+         directory (build it with `nix build .#rvm-model` or tools/split_refiner.py)"
+    ))
 }
 
 /// Format an OpenVINO error with what we were doing.
