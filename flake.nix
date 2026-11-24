@@ -38,12 +38,29 @@
         python ${./tools/split_refiner.py} ${rvm-onnx} $out/rvm_mobilenetv3_fp16_core.onnx
       '';
 
+      # MediaPipe's selfie segmenter (landscape, Apache-2.0), converted to
+      # OpenVINO IR by tools/convert_selfie.py: OpenVINO can't read one of its
+      # custom TFLite ops, and the conversion also makes it take the daemon's
+      # f16 planes directly.
+      selfie-tflite = pkgs.fetchurl {
+        name = "selfie_segmenter_landscape.tflite";
+        url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/1/selfie_segmenter_landscape.tflite";
+        hash = "sha256-SQ6epzQxPg3hD6DNnjxhM+NupNsrekm96e8Bn3J5a44=";
+      };
+      selfie-model = pkgs.runCommand "selfie-segmenter-landscape-openvino" {
+        nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.openvino ])) ];
+      } ''
+        mkdir -p $out
+        python ${./tools/convert_selfie.py} ${selfie-tflite} $out/selfie_segmenter_landscape.xml
+      '';
+
       pythonEnv = pkgs.python3.withPackages (ps: with ps; [
         ps.openvino
         ps.onnx
       ]);
     in {
       packages.x86_64-linux.rvm-model = rvm-model;
+      packages.x86_64-linux.selfie-model = selfie-model;
 
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = with pkgs; [
@@ -68,6 +85,7 @@
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
         VIDEO_MENU_MODEL = "${rvm-model}/rvm_mobilenetv3_fp16_core.onnx";
+        VIDEO_MENU_SELFIE_MODEL = "${selfie-model}/selfie_segmenter_landscape.xml";
         LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
       };
     };
