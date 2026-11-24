@@ -1,0 +1,9 @@
+[package]
+name = "video-menu-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37.0"
+video-menu-protocol = { version = "0.1.0", path = "../protocol" }
+zbus = "6.5.0"

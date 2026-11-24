@@ -86,7 +86,9 @@
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
         VIDEO_MENU_MODEL = "${rvm-model}/rvm_mobilenetv3_fp16_core.onnx";
         VIDEO_MENU_SELFIE_MODEL = "${selfie-model}/selfie_segmenter_landscape.xml";
-        LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
+        # The GUI's windowing (winit) loads the Wayland and xkbcommon libraries
+        # at runtime, like wgpu does Vulkan.
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.wayland}/lib:${pkgs.libxkbcommon}/lib:${pkgs.vulkan-loader}/lib:${pkgs.openvino}/runtime/lib/intel64:${pkgs.level-zero}/lib:${npu-driver-compiler}/lib";
       };
     };
 }
