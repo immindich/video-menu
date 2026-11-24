@@ -1,7 +1,12 @@
 //! Frame processing: camera pixels are unpacked into planar RGB, effects run
 //! on that, and the result is packed as YUY2 for the virtual camera.
 
+use std::time::Duration;
+
+use half::{f16, slice::HalfFloatSliceExt};
 use pipewire::spa::param::video::VideoFormat;
+
+use crate::model::{MODEL_HEIGHT, MODEL_PIXELS, MODEL_WIDTH, Matte};
 
 /// A frame as three planes (R, G, B) of `f32` samples in `0..=1`.
 #[derive(Default)]
@@ -169,14 +174,22 @@ pub fn pack_yuy2_bt601(frame: &PlanarFrame, dst: &mut [u8], stride: usize) {
 
 /// An in-place transformation of a frame.
 pub trait Effect {
-    fn apply(&mut self, frame: &mut PlanarFrame);
+    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String>;
+
+    /// Time the last [`apply`](Self::apply) spent waiting for a model.
+    fn model_time(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Forget any temporal state, e.g. after switching cameras.
+    fn reset(&mut self) {}
 }
 
-/// Flips the frame upside down. A stand-in until real effects exist.
+/// Flips the frame upside down. Used in tests.
 pub struct VerticalFlip;
 
 impl Effect for VerticalFlip {
-    fn apply(&mut self, frame: &mut PlanarFrame) {
+    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
         let (width, height) = (frame.width(), frame.height());
         for plane in frame.planes_mut() {
             for y in 0..height / 2 {
@@ -184,6 +197,119 @@ impl Effect for VerticalFlip {
                 top[y * width..][..width].swap_with_slice(&mut bottom[..width]);
             }
         }
+        Ok(())
+    }
+}
+
+/// Chroma-key green (0, 177, 64).
+pub const GREEN: [f32; 3] = [0.0, 177.0 / 255.0, 64.0 / 255.0];
+
+/// Bilinear resampling taps from `n_in` samples to `n_out`, matching
+/// PyTorch's `align_corners=False` without antialiasing (ONNX Resize with
+/// `pytorch_half_pixel`), which is how RVM resamples. Each tap is
+/// `(i0, i1, weight of i1)`. `pipeline.wgsl` computes the same.
+fn taps(n_in: usize, n_out: usize) -> Vec<(usize, usize, f32)> {
+    let scale = n_in as f32 / n_out as f32;
+    (0..n_out)
+        .map(|i| {
+            let x = ((i as f32 + 0.5) * scale - 0.5).clamp(0.0, (n_in - 1) as f32);
+            let i0 = x as usize;
+            (i0, (i0 + 1).min(n_in - 1), x - i0 as f32)
+        })
+        .collect()
+}
+
+/// Resample `planes` planes of `w`x`h` in `src` to `dw`x`dh` in `dst`.
+fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usize, dh: usize, planes: usize) {
+    let (xs, ys) = (taps(w, dw), taps(h, dh));
+    let mut row = vec![0f32; w];
+    for p in 0..planes {
+        let (src, dst) = (&src[p * w * h..][..w * h], &mut dst[p * dw * dh..][..dw * dh]);
+        for (&(y0, y1, wy), out) in ys.iter().zip(dst.chunks_exact_mut(dw)) {
+            let (r0, r1) = (&src[y0 * w..][..w], &src[y1 * w..][..w]);
+            for ((v, a), b) in row.iter_mut().zip(r0).zip(r1) {
+                *v = a * (1.0 - wy) + b * wy;
+            }
+            for (o, &(x0, x1, wx)) in out.iter_mut().zip(&xs) {
+                *o = row[x0] * (1.0 - wx) + row[x1] * wx;
+            }
+        }
+    }
+}
+
+/// Replaces the background with green, using the matting model to find the
+/// foreground.
+///
+/// The frame is downsampled to the model's resolution, the model returns
+/// coefficients `A` and `b` there, and these are upsampled to the frame's
+/// resolution, where `A * [R, G, B, gray] + b` gives the foreground colour
+/// (as a residual on the frame) and alpha. This is RVM's own refiner step.
+pub struct GreenScreen {
+    matte: Box<dyn Matte>,
+    background: [f32; 3],
+    /// Size of the last frame; the model's temporal state is reset when it
+    /// changes.
+    size: (usize, usize),
+    small: Vec<f32>,
+    small16: Vec<f16>,
+    coef: Vec<f32>,
+    coef_full: Vec<f32>,
+}
+
+impl GreenScreen {
+    pub fn new(matte: Box<dyn Matte>) -> Self {
+        Self {
+            matte,
+            background: GREEN,
+            size: (0, 0),
+            small: vec![0.0; 3 * MODEL_PIXELS],
+            small16: vec![f16::ZERO; 3 * MODEL_PIXELS],
+            coef: vec![0.0; 8 * MODEL_PIXELS],
+            coef_full: Vec::new(),
+        }
+    }
+}
+
+impl Effect for GreenScreen {
+    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
+        let (w, h) = (frame.width(), frame.height());
+        if self.size != (w, h) {
+            self.matte.reset();
+            self.size = (w, h);
+        }
+        resample(&frame.data, w, h, &mut self.small, MODEL_WIDTH, MODEL_HEIGHT, 3);
+        self.small16.convert_from_f32_slice(&self.small);
+        let (a, b) = self.matte.infer(&self.small16)?;
+        let n = 4 * MODEL_PIXELS;
+        a.convert_to_f32_slice(&mut self.coef[..n]);
+        b.convert_to_f32_slice(&mut self.coef[n..]);
+
+        // Upsample all 8 coefficient planes (A then b) to the frame size.
+        let pixels = w * h;
+        self.coef_full.resize(8 * pixels, 0.0);
+        resample(&self.coef, MODEL_WIDTH, MODEL_HEIGHT, &mut self.coef_full, w, h, 8);
+
+        let bg = self.background;
+        let [rp, gp, bp] = frame.planes_mut();
+        let c = |k: usize| &self.coef_full[k * pixels..][..pixels];
+        for i in 0..pixels {
+            let x = [rp[i], gp[i], bp[i], (rp[i] + gp[i] + bp[i]) * (1.0 / 3.0)];
+            let out = |k: usize| c(k)[i] * x[k] + c(4 + k)[i];
+            let pha = out(3).clamp(0.0, 1.0);
+            let fgr = [0, 1, 2].map(|k| (out(k) + x[k]).clamp(0.0, 1.0));
+            rp[i] = fgr[0] * pha + bg[0] * (1.0 - pha);
+            gp[i] = fgr[1] * pha + bg[1] * (1.0 - pha);
+            bp[i] = fgr[2] * pha + bg[2] * (1.0 - pha);
+        }
+        Ok(())
+    }
+
+    fn model_time(&self) -> Duration {
+        self.matte.last_time()
+    }
+
+    fn reset(&mut self) {
+        self.matte.reset();
     }
 }
 
@@ -265,7 +391,44 @@ mod tests {
     fn vertical_flip() {
         let rows: Vec<[f32; 3]> = (0..6).map(|i| [i as f32, 0.0, 0.0]).collect();
         let mut frame = frame_from(2, 3, &rows);
-        VerticalFlip.apply(&mut frame);
+        VerticalFlip.apply(&mut frame).unwrap();
         assert_eq!(frame.planes()[0], [4.0, 5.0, 2.0, 3.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn resample_matches_pytorch_half_pixel() {
+        // Downsampling by exactly 4 averages the middle two of each four
+        // samples: (i + 0.5) * 4 - 0.5 = 4i + 1.5.
+        let src: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let mut dst = [0.0; 2];
+        resample(&src, 8, 1, &mut dst, 2, 1, 1);
+        assert_eq!(dst, [1.5, 5.5]);
+        // Upsampling by 2 clamps at the edges and interpolates between.
+        let mut up = [0.0; 4];
+        resample(&[0.0, 1.0], 2, 1, &mut up, 4, 1, 1);
+        assert_eq!(up, [0.0, 0.25, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn green_screen_composites_by_alpha() {
+        use crate::model::fake::FakeMatte;
+        let (w, h) = (64, 36);
+        let rows: Vec<[f32; 3]> = (0..w * h)
+            .map(|i| [(i % w) as f32 / w as f32, (i / w) as f32 / h as f32, 0.5])
+            .collect();
+        let mut frame = frame_from(w, h, &rows);
+        let mut effect = GreenScreen::new(Box::<FakeMatte>::default());
+        effect.apply(&mut frame).unwrap();
+        // Every output pixel lies between the (clamped) foreground and green.
+        for (k, plane) in frame.planes().iter().enumerate() {
+            assert!(plane.iter().all(|v| (0.0..=1.0).contains(v)), "channel {k} out of range");
+        }
+        // The fake model's alpha is 2R - B + ...: low on the left, high on
+        // the right, so the left edge is green and the right is not.
+        let [r, g, b] = frame.planes();
+        let left = (r[0], g[0], b[0]);
+        assert!((left.0 - GREEN[0]).abs() < 0.05 && (left.1 - GREEN[1]).abs() < 0.05, "{left:?}");
+        let right = w - 1;
+        assert!((g[right] - GREEN[1]).abs() > 0.1, "right edge should keep its own colour");
     }
 }
