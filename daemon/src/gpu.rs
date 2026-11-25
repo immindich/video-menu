@@ -302,7 +302,7 @@ impl GpuProcessor {
         self.ensure_shared(width, height);
         self.ensure_slot(slot, blur.map_or(0, |g| g.len()));
         if let Some(p) = &self.profiler {
-            p.begin(format!("{width}x{height} {background:?}"));
+            p.begin(slot, format!("{width}x{height} {background:?}"));
         }
 
         // Upload, dropping any row padding so the shader can index rows tightly.
@@ -321,7 +321,7 @@ impl GpuProcessor {
         let params = self.params(input, width, height, background, blur.as_ref());
         self.queue.write_buffer(&self.slots[slot].params, 0, bytemuck::bytes_of(&params));
         self.slots[slot].job = Some(Job { width, height, background, blur, blurred: false });
-        self.mark("uploaded");
+        self.mark(slot, "uploaded");
 
         // The model's input first, straight from the camera's bytes, and its
         // readback; then the full-resolution unpack, which runs while the
@@ -342,8 +342,10 @@ impl GpuProcessor {
             self.dispatch(&mut encoder, slot, downsample, name, (mw / 2) as u32, mh as u32);
             let bytes = self.small.size();
             encoder.copy_buffer_to_buffer(&self.small, 0, &self.small_readback, 0, bytes);
-            let index = self.queue.submit([encoder.finish()]);
-            self.submitted("model input");
+            let commands = encoder.finish();
+            self.submitted(slot, "model input");
+            let index = self.queue.submit([commands]);
+            self.mark(slot, "submit returned");
             (index, bytes)
         });
         let (w, h) = (width as u32, height as u32);
@@ -352,13 +354,15 @@ impl GpuProcessor {
             InputFormat::Packed { .. } => self.dispatch(&mut encoder, slot, &self.unpack_packed, "unpack_packed", w, h),
             InputFormat::Yuy2 => self.dispatch(&mut encoder, slot, &self.unpack_yuy2, "unpack_yuy2", w / 2, h),
         }
-        self.queue.submit([encoder.finish()]);
-        self.submitted("unpack");
+        let commands = encoder.finish();
+        self.submitted(slot, "unpack");
+        self.queue.submit([commands]);
+        self.mark(slot, "submit returned");
         let Some((index, bytes)) = model_input else {
             return Ok(background.is_some());
         };
         self.wait_mapped(&self.small_readback, bytes, index)?;
-        self.mark("model input waited");
+        self.mark(slot, "model input waited");
         {
             let mapped = self
                 .small_readback
@@ -386,8 +390,10 @@ impl GpuProcessor {
         job.blurred = true;
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.record_blur(&mut encoder, slot, &g);
-        self.queue.submit([encoder.finish()]);
-        self.submitted("blur");
+        let commands = encoder.finish();
+        self.submitted(slot, "blur");
+        self.queue.submit([commands]);
+        self.mark(slot, "submit returned");
         true
     }
 
@@ -441,12 +447,14 @@ impl GpuProcessor {
         let out_bytes = (job.width * 2 * job.height) as u64;
         encoder.copy_buffer_to_buffer(&shared.output, 0, &shared.readback, 0, out_bytes);
         if let Some(p) = &self.profiler {
-            p.resolve(&mut encoder);
+            p.resolve(slot, &mut encoder);
         }
-        let index = self.queue.submit([encoder.finish()]);
-        self.submitted("output");
+        let commands = encoder.finish();
+        self.submitted(slot, "output");
+        let index = self.queue.submit([commands]);
+        self.mark(slot, "submit returned");
         self.wait_mapped(&shared.readback, out_bytes, index)?;
-        self.mark("output waited");
+        self.mark(slot, "output waited");
 
         {
             let mapped = shared
@@ -461,8 +469,8 @@ impl GpuProcessor {
         }
         shared.readback.unmap();
         if let Some(p) = &self.profiler {
-            p.mark("output copied");
-            p.finish(&self.device);
+            p.mark(slot, "output copied");
+            p.finish(slot, &self.device);
         }
         Ok(())
     }
@@ -511,16 +519,26 @@ impl GpuProcessor {
         params
     }
 
-    /// Note an event in the profile, if profiling.
-    pub fn mark(&self, name: &'static str) {
+    /// Note an event for the frame in `slot` in the profile, if profiling.
+    pub fn mark(&self, slot: usize, name: &'static str) {
         if let Some(p) = &self.profiler {
-            p.mark(name);
+            p.mark(slot, name);
         }
     }
 
-    fn submitted(&self, name: &'static str) {
+    /// Note a number about the frame in `slot` in the profile, if profiling.
+    pub fn note(&self, slot: usize, name: &'static str, value: u64) {
         if let Some(p) = &self.profiler {
-            p.submitted(name);
+            p.note(slot, name, value);
+        }
+    }
+
+    /// Note a submission for the frame in `slot`. Called just before
+    /// `submit()`, as the GPU may start on it before the call returns;
+    /// "submit returned" is marked after, showing what the call costs.
+    fn submitted(&self, slot: usize, name: &'static str) {
+        if let Some(p) = &self.profiler {
+            p.submitted(slot, name);
         }
     }
 
@@ -535,7 +553,7 @@ impl GpuProcessor {
         x: u32,
         y: u32,
     ) {
-        let timestamp_writes = self.profiler.as_ref().and_then(|p| p.pass(name));
+        let timestamp_writes = self.profiler.as_ref().and_then(|p| p.pass(slot, name));
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes });
         pass.set_bind_group(0, &self.slots[slot].bind_group, &[]);
         pass.set_pipeline(pipeline);

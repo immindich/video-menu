@@ -164,11 +164,19 @@ impl Backend {
         }
     }
 
-    /// Note an event in the GPU profile, if profiling.
-    #[cfg(test)]
-    fn mark(&self, name: &'static str) {
+    /// Note an event for the frame in `slot` in the GPU profile, if
+    /// profiling.
+    pub fn mark(&self, slot: usize, name: &'static str) {
         if let Self::Gpu(gpu) = self {
-            gpu.mark(name);
+            gpu.mark(slot, name);
+        }
+    }
+
+    /// Note a number about the frame in `slot` in the GPU profile, if
+    /// profiling.
+    pub fn note(&self, slot: usize, name: &'static str, value: u64) {
+        if let Self::Gpu(gpu) = self {
+            gpu.note(slot, name, value);
         }
     }
 }
@@ -281,13 +289,13 @@ impl Processor {
         let t = Instant::now();
         match self.matting.as_mut().filter(|_| wants_model) {
             Some(matting) => {
-                self.backend.mark("model start");
+                self.backend.mark(0, "model start");
                 matting.begin(self.backend.model_input())?;
                 let tb = Instant::now();
                 self.backend.blur(0);
                 blur = tb.elapsed();
                 let coefficients = matting.end()?;
-                self.backend.mark("model done");
+                self.backend.mark(0, "model done");
                 let tf = Instant::now();
                 self.backend.finish(0, Some(coefficients), dst, dst_stride)?;
                 let finish = tf.elapsed();

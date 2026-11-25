@@ -199,6 +199,8 @@ struct InFlight {
     height: usize,
     out_stride: usize,
     stages: [Duration; 5],
+    /// From the camera to the start of ingest (waiting for the pipeline).
+    queued: Duration,
 }
 
 /// The pipeline thread's state.
@@ -231,6 +233,12 @@ struct Pipeline {
     output: Box<dyn FnMut(Output) + Send>,
     dropped: u32,
     flushes: Vec<mpsc::Sender<()>>,
+    /// For the profile: time the pipeline thread spent handling events and
+    /// waiting for them, and the model thread inferring, since the last
+    /// finished frame.
+    busy: Duration,
+    idle: Duration,
+    model_busy: Duration,
 }
 
 impl Pipeline {
@@ -270,9 +278,13 @@ impl Pipeline {
             output,
             dropped: 0,
             flushes: Vec::new(),
+            busy: Duration::ZERO,
+            idle: Duration::ZERO,
+            model_busy: Duration::ZERO,
         };
         pipeline.set_effects(effects);
         loop {
+            let t = Instant::now();
             let event = match pipeline.deferred.pop_front() {
                 Some(event) => event,
                 None => match pipeline.rx.recv() {
@@ -280,9 +292,12 @@ impl Pipeline {
                     Err(_) => break,
                 },
             };
+            let t2 = Instant::now();
+            pipeline.idle += t2 - t;
             if !pipeline.handle(event) {
                 break;
             }
+            pipeline.busy += t2.elapsed();
             if pipeline.sched.idle() && !pipeline.flushes.is_empty() {
                 for flush in pipeline.flushes.drain(..) {
                     let _ = flush.send(());
@@ -333,6 +348,11 @@ impl Pipeline {
             Event::Recycle(frame) => self.out_pool.push(frame),
             Event::ModelDone { id, a, b, input, time } => {
                 self.input_pool.push(input);
+                self.model_busy += time;
+                if let Some(slot) = self.slot_of(id) {
+                    self.backend.mark(slot, "model returned");
+                    self.backend.note(slot, "inference_us", time.as_micros() as u64);
+                }
                 (self.latest, self.latest_time) = ((a, b), time);
                 if let Some(frame) = self.frames.get_mut(&id) {
                     frame.stages[3] = time;
@@ -415,6 +435,7 @@ impl Pipeline {
         }
         let id = self.next_id;
         self.next_id += 1;
+        let queued = job.arrived.elapsed();
         let mut stages = [Duration::ZERO; 5];
         let slot = self.sched.take_slot();
         let wants = (|| {
@@ -455,8 +476,9 @@ impl Pipeline {
             input.extend_from_slice(self.backend.model_input());
             self.inputs.insert(id, input);
         }
-        self.frames.insert(id, InFlight { generation, pts, seq, arrived, height, out_stride, stages });
+        self.frames.insert(id, InFlight { generation, pts, seq, arrived, height, out_stride, stages, queued });
         self.slots[slot] = Some(id);
+        self.backend.note(slot, "decode_us", stages[0].as_micros() as u64);
         let actions = self.sched.ingested(id, slot, wants);
         self.act(actions);
     }
@@ -468,6 +490,9 @@ impl Pipeline {
                 Action::Dispatch(id) => {
                     let input = self.inputs.remove(&id).expect("a model input for each frame dispatched");
                     let _ = self.model.send(ModelJob::Run { id, input });
+                    if let Some(slot) = self.slot_of(id) {
+                        self.backend.mark(slot, "dispatched");
+                    }
                 }
                 Action::Blur(slot) => {
                     let t = Instant::now();
@@ -496,6 +521,15 @@ impl Pipeline {
         let Some(mut frame) = self.frames.remove(&id) else { return };
         let mut out = self.out_pool.pop().unwrap_or_default();
         out.resize(frame.out_stride * frame.height, 0);
+        self.backend.mark(slot, "finish");
+        for (name, value) in [
+            ("queued_us", frame.queued),
+            ("pipeline_busy_us", std::mem::take(&mut self.busy)),
+            ("pipeline_idle_us", std::mem::take(&mut self.idle)),
+            ("model_busy_us", std::mem::take(&mut self.model_busy)),
+        ] {
+            self.backend.note(slot, name, value.as_micros() as u64);
+        }
         let t = Instant::now();
         let coefficients = model.then_some((self.latest.0.as_slice(), self.latest.1.as_slice()));
         if let Err(e) = self.backend.finish(slot, coefficients, &mut out, frame.out_stride) {
@@ -517,6 +551,11 @@ impl Pipeline {
             stages: frame.stages,
             dropped: std::mem::take(&mut self.dropped),
         });
+    }
+
+    /// The slot holding frame `id`, if any.
+    fn slot_of(&self, id: FrameId) -> Option<usize> {
+        self.slots.iter().position(|s| *s == Some(id))
     }
 
     fn give_back(&self, buffer: Vec<u8>) {

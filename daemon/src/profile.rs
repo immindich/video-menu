@@ -1,19 +1,24 @@
 //! Opt-in timeline of each frame's GPU work, for finding where the time
 //! between the CPU and the GPU goes. Set `VIDEO_MENU_GPU_PROFILE=FILE` and
-//! the GPU backend writes one JSON line per frame to `FILE`:
+//! the GPU backend writes one JSON line per finished frame to `FILE`:
 //!
-//! - `marks`: CPU events (`[name, ns]`), e.g. each submit and when the wait
-//!   for it returned;
-//! - `passes`: each compute pass (`[name, submission, begin_ns, end_ns]`),
+//! - `marks`: CPU events of that frame (`[name, ns]`), e.g. each submit,
+//!   when the wait for it returned, when it went to the model;
+//! - `passes`: its compute passes (`[name, submission, begin_ns, end_ns]`),
 //!   from GPU timestamps;
-//! - `submits`: the submissions in order, so passes can be matched to them;
-//! - `freq_mhz`: the GPU's actual clock at the start and end of the frame.
+//! - `submits`: its submissions in order, so passes can be matched to them;
+//! - `notes`: numbers the worker adds (`[name, value]`), such as how busy
+//!   its threads were since the previous frame;
+//! - `freq_mhz`: the GPU's actual clock when the frame was ingested and
+//!   finished.
 //!
-//! CPU times count from when the profiler started; GPU times are the GPU's
-//! own clock, whose offset from the CPU's is unknown (no calibrated
-//! timestamps in wgpu). Durations on either clock are exact, and comparing a
-//! submission's CPU wait with its GPU busy time gives the overhead around
-//! it. `tools/gpu_profile_report.py` summarises a file.
+//! Frames overlap (see [`crate::worker`]), so a record belongs to the
+//! frame's slot from ingest to finish. CPU times count from when the
+//! profiler started; GPU times are the GPU's own clock, whose offset from
+//! the CPU's is unknown (no calibrated timestamps in wgpu). Durations on
+//! either clock are exact, and comparing a submission's CPU wait with its
+//! GPU busy time gives the overhead around it. `tools/gpu_profile_report.py`
+//! summarises a file.
 //!
 //! Recording costs a timestamp per pass and one small readback per frame.
 
@@ -25,8 +30,10 @@ use std::{
     time::Instant,
 };
 
-/// Timestamp queries available per frame: two per pass.
-const QUERIES: u32 = 64;
+use crate::gpu::SLOTS;
+
+/// Timestamp queries per slot: two per pass.
+const PER_SLOT: u32 = 32;
 
 /// The GPU's actual clock, as the xe driver reports it.
 const FREQ_PATH: &str = "/sys/class/drm/card0/device/tile0/gt0/freq0/act_freq";
@@ -37,6 +44,7 @@ struct Frame {
     /// Name and submission of each pass, in query order.
     passes: Vec<(&'static str, usize)>,
     submits: Vec<&'static str>,
+    notes: Vec<(&'static str, u64)>,
     freq_start: Option<u32>,
     label: String,
 }
@@ -48,7 +56,7 @@ pub struct GpuProfiler {
     period_ns: f64,
     origin: Instant,
     out: RefCell<BufWriter<File>>,
-    frame: RefCell<Frame>,
+    frames: RefCell<Vec<Frame>>,
 }
 
 impl GpuProfiler {
@@ -68,7 +76,8 @@ impl GpuProfiler {
             }
         };
         eprintln!("profile: writing a GPU timeline to {path}");
-        let bytes = QUERIES as u64 * 8;
+        let queries = SLOTS as u32 * PER_SLOT;
+        let bytes = queries as u64 * 8;
         let buffer = |label, usage| {
             device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes, usage, mapped_at_creation: false })
         };
@@ -77,75 +86,89 @@ impl GpuProfiler {
             query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("profile"),
                 ty: wgpu::QueryType::Timestamp,
-                count: QUERIES,
+                count: queries,
             }),
             resolve: buffer("profile resolve", U::QUERY_RESOLVE | U::COPY_SRC),
             readback: buffer("profile readback", U::MAP_READ | U::COPY_DST),
             period_ns: queue.get_timestamp_period() as f64,
             origin: Instant::now(),
             out: RefCell::new(BufWriter::new(file)),
-            frame: RefCell::default(),
+            frames: RefCell::new((0..SLOTS).map(|_| Frame::default()).collect()),
         })
     }
 
-    /// Start a frame's record; `label` describes it (size, effect).
-    pub fn begin(&self, label: String) {
-        *self.frame.borrow_mut() = Frame { freq_start: read_freq(), label, ..Frame::default() };
-        self.mark("start");
+    /// Start the record of the frame ingested into `slot`; `label`
+    /// describes it (size, effect).
+    pub fn begin(&self, slot: usize, label: String) {
+        self.frames.borrow_mut()[slot] = Frame { freq_start: read_freq(), label, ..Frame::default() };
+        self.mark(slot, "start");
     }
 
-    /// Note that the CPU reached `name` now.
-    pub fn mark(&self, name: &'static str) {
+    /// Note that the CPU reached `name` now, for the frame in `slot`.
+    pub fn mark(&self, slot: usize, name: &'static str) {
         let ns = self.origin.elapsed().as_nanos() as u64;
-        self.frame.borrow_mut().marks.push((name, ns));
+        self.frames.borrow_mut()[slot].marks.push((name, ns));
     }
 
-    /// Note a submission now: passes recorded after this belong to the next.
-    pub fn submitted(&self, name: &'static str) {
-        self.mark(name);
-        self.frame.borrow_mut().submits.push(name);
+    /// Note a number about the frame in `slot`.
+    pub fn note(&self, slot: usize, name: &'static str, value: u64) {
+        self.frames.borrow_mut()[slot].notes.push((name, value));
     }
 
-    /// Timestamp writes for a pass called `name`, if there is room.
-    pub fn pass(&self, name: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        let mut frame = self.frame.borrow_mut();
+    /// Note a submission for the frame in `slot` now: its passes recorded
+    /// after this belong to the next.
+    pub fn submitted(&self, slot: usize, name: &'static str) {
+        self.mark(slot, name);
+        self.frames.borrow_mut()[slot].submits.push(name);
+    }
+
+    /// Timestamp writes for a pass called `name` of the frame in `slot`, if
+    /// there is room.
+    pub fn pass(&self, slot: usize, name: &'static str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let mut frames = self.frames.borrow_mut();
+        let frame = &mut frames[slot];
         let i = frame.passes.len() as u32;
-        if 2 * i + 2 > QUERIES {
+        if 2 * i + 2 > PER_SLOT {
             return None;
         }
-        let submission = frame.submits.len();
-        frame.passes.push((name, submission));
+        frame.passes.push((name, frame.submits.len()));
+        let base = slot as u32 * PER_SLOT;
         Some(wgpu::ComputePassTimestampWrites {
             query_set: &self.query_set,
-            beginning_of_pass_write_index: Some(2 * i),
-            end_of_pass_write_index: Some(2 * i + 1),
+            beginning_of_pass_write_index: Some(base + 2 * i),
+            end_of_pass_write_index: Some(base + 2 * i + 1),
         })
     }
 
-    /// Copy the frame's timestamps out; record in the frame's last encoder.
-    pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        let n = 2 * self.frame.borrow().passes.len() as u32;
+    /// Copy the timestamps of the frame in `slot` out; record in its last
+    /// encoder.
+    pub fn resolve(&self, slot: usize, encoder: &mut wgpu::CommandEncoder) {
+        let n = 2 * self.frames.borrow()[slot].passes.len() as u32;
         if n > 0 {
-            encoder.resolve_query_set(&self.query_set, 0..n, &self.resolve, 0);
-            encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, n as u64 * 8);
+            let base = slot as u32 * PER_SLOT;
+            let offset = base as u64 * 8;
+            encoder.resolve_query_set(&self.query_set, base..base + n, &self.resolve, offset);
+            encoder.copy_buffer_to_buffer(&self.resolve, offset, &self.readback, offset, n as u64 * 8);
         }
     }
 
-    /// Read the timestamps back (the frame's work must have finished) and
-    /// write the frame's line.
-    pub fn finish(&self, device: &wgpu::Device) {
-        self.mark("end");
-        let frame = std::mem::take(&mut *self.frame.borrow_mut());
+    /// Read the timestamps of the frame in `slot` back (its work must have
+    /// finished) and write its line.
+    pub fn finish(&self, slot: usize, device: &wgpu::Device) {
+        self.mark(slot, "end");
+        let frame = std::mem::take(&mut self.frames.borrow_mut()[slot]);
         let n = 2 * frame.passes.len() as u64;
+        let offset = slot as u64 * PER_SLOT as u64 * 8;
         let mut stamps = Vec::new();
         if n > 0 {
+            let range = offset..offset + n * 8;
             let (tx, rx) = mpsc::channel();
-            self.readback.slice(..n * 8).map_async(wgpu::MapMode::Read, move |r| {
+            self.readback.slice(range.clone()).map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             if let Ok(Ok(())) = rx.recv() {
-                if let Ok(mapped) = self.readback.slice(..n * 8).get_mapped_range() {
+                if let Ok(mapped) = self.readback.slice(range).get_mapped_range() {
                     stamps = bytemuck::cast_slice::<u8, u64>(&mapped).to_vec();
                 }
                 self.readback.unmap();
@@ -161,16 +184,19 @@ impl GpuProfiler {
                 Some(format!("[\"{name}\",{sub},{},{}]", ns(*b), ns(*e)))
             })
             .collect();
-        let marks: Vec<String> = frame.marks.iter().map(|(m, t)| format!("[\"{m}\",{t}]")).collect();
+        let pairs = |items: &[(&str, u64)]| -> String {
+            items.iter().map(|(m, t)| format!("[\"{m}\",{t}]")).collect::<Vec<_>>().join(",")
+        };
         let submits: Vec<String> = frame.submits.iter().map(|s| format!("\"{s}\"")).collect();
         let freq = |f: Option<u32>| f.map_or("null".into(), |f| f.to_string());
         let line = format!(
-            "{{\"label\":\"{}\",\"freq_mhz\":[{},{}],\"submits\":[{}],\"marks\":[{}],\"passes\":[{}]}}",
+            "{{\"label\":\"{}\",\"freq_mhz\":[{},{}],\"submits\":[{}],\"marks\":[{}],\"notes\":[{}],\"passes\":[{}]}}",
             frame.label,
             freq(frame.freq_start),
             freq(read_freq()),
             submits.join(","),
-            marks.join(","),
+            pairs(&frame.marks),
+            pairs(&frame.notes),
             passes.join(",")
         );
         let mut out = self.out.borrow_mut();

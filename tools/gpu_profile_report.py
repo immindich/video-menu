@@ -11,8 +11,11 @@ as warm-up):
   shader time nor copies), split into the delay before the GPU started and
   the delay after it finished;
 - time per pass on the GPU;
+- per frame, from the worker's notes: time queued before ingest, decode,
+  inference and the latency from the camera to the output; throughput, and
+  how busy the pipeline and model threads were;
 - the GPU clock (0 when the GPU is asleep), and whether slow frames follow
-  a long idle gap or a low clock.
+  a low clock.
 
 The GPU's clock and the CPU's have an unknown offset. Start delays are shown
 relative to the quickest start seen in the file (so the true values are
@@ -68,7 +71,31 @@ def main():
                 order.append(f"{a} -> {b}")
     for step in order:
         print(row(step, steps[step], width=40))
-    print(row("whole frame (GPU backend)", totals, width=40))
+    print(row("ingest to output (GPU backend)", totals, width=40))
+
+    # Per frame, from the worker's notes (frames overlap, so these don't
+    # add up to the time between frames).
+    notes = [dict(f.get("notes", [])) for f in frames]
+    if any(notes):
+        us = lambda key: [n[key] * 1000 for n in notes if key in n]
+        latency = [n["queued_us"] * 1000 + t for n, t in zip(notes, totals) if "queued_us" in n]
+        print("\nPer frame (ms):")
+        print(row("camera to ingest (queued)", us("queued_us"), width=40))
+        print(row("decode (MJPG)", [v for v in us("decode_us") if v > 0], width=40))
+        print(row("inference (model thread)", us("inference_us"), width=40))
+        print(row("latency (camera to output)", latency, width=40))
+
+        # Throughput and how busy each thread was.
+        ends = [f["marks"][-1][1] for f in frames]
+        wall = ends[-1] - ends[0]
+        if wall > 0:
+            busy = sum(n.get("pipeline_busy_us", 0) for n in notes[1:])
+            idle = sum(n.get("pipeline_idle_us", 0) for n in notes[1:])
+            model = sum(n.get("model_busy_us", 0) for n in notes[1:])
+            print(f"\nThroughput: {(len(frames) - 1) / wall * 1e9:.1f} fps")
+            if busy + idle > 0:
+                print(f"  pipeline thread busy {100 * busy / (busy + idle):.0f}% of the time")
+            print(f"  model thread busy {100 * model * 1000 / wall:.0f}% of the time")
 
     # Submissions: CPU wait vs GPU busy.
     raw_start = {}  # submission -> [gpu_begin - cpu_submit]
@@ -139,10 +166,8 @@ def main():
     asleep = sum(1 for fr in start_freq if fr == 0)
     print(f"  asleep at {asleep} of {len(start_freq)} frame starts")
 
-    idle = []  # CPU time from the previous frame's end to this one's start
-    for prev, f in zip(frames, frames[1:]):
-        idle.append(f["marks"][0][1] - prev["marks"][-1][1])
-    print(row("\n  idle between frames (ms)", idle, width=33))
+    interval = [f["marks"][-1][1] - prev["marks"][-1][1] for prev, f in zip(frames, frames[1:])]
+    print(row("\n  between finished frames (ms)", interval, width=33))
 
     overhead = []
     for f in frames:
@@ -154,13 +179,7 @@ def main():
                 total += marks[f"{sub} waited"] - marks[sub] - (max(p[3] for p in passes) - min(p[2] for p in passes))
         overhead.append(total)
     if len(frames) > 10:
-        pairs = list(zip(idle, overhead[1:]))
-        print("\nDoes the overhead follow long idle gaps or a low clock? (median overhead, ms)")
-        cut = statistics.median(i for i, _ in pairs)
-        short = [o for i, o in pairs if i <= cut]
-        long_ = [o for i, o in pairs if i > cut]
-        print(f"  after idle <= {cut / 1e6:.1f} ms: {statistics.median(short) / 1e6:.2f}   "
-              f"after longer idle: {statistics.median(long_) / 1e6:.2f}")
+        print("\nDoes the overhead follow a low clock? (median overhead per frame, ms)")
         with_freq = [(f["freq_mhz"][0], o) for f, o in zip(frames, overhead) if f["freq_mhz"][0] is not None]
         if with_freq:
             fcut = statistics.median(fr for fr, _ in with_freq)
