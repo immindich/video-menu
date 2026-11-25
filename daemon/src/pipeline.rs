@@ -174,7 +174,19 @@ pub fn pack_yuy2_bt601(frame: &PlanarFrame, dst: &mut [u8], stride: usize) {
 
 /// An in-place transformation of a frame.
 pub trait Effect {
-    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String>;
+    #[cfg(test)]
+    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
+        self.apply_with_input(frame, None)
+    }
+
+    /// [`apply`](Self::apply), with the model's input already made (e.g.
+    /// by a scaled JPEG decode) for effects that run a model.
+    fn apply_with_input(&mut self, frame: &mut PlanarFrame, model_input: Option<&[f16]>) -> Result<(), String>;
+
+    /// The resolution of the model this effect runs, if any.
+    fn model_size(&self) -> Option<(usize, usize)> {
+        None
+    }
 
     /// Time the last [`apply`](Self::apply) spent waiting for a model.
     fn model_time(&self) -> Duration {
@@ -448,7 +460,11 @@ impl ReplaceBackground {
 }
 
 impl Effect for ReplaceBackground {
-    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
+    fn model_size(&self) -> Option<(usize, usize)> {
+        Some(self.matte.size())
+    }
+
+    fn apply_with_input(&mut self, frame: &mut PlanarFrame, model_input: Option<&[f16]>) -> Result<(), String> {
         let (w, h) = (frame.width(), frame.height());
         if self.size != (w, h) {
             self.reset();
@@ -462,8 +478,14 @@ impl Effect for ReplaceBackground {
             Background::Color(_) => false,
         };
         let (mw, mh) = self.matte.size();
-        resample(&frame.data, w, h, &mut self.small, mw, mh, 3);
-        self.small16.convert_from_f32_slice(&self.small);
+        match model_input {
+            Some(input) if input.len() == self.small16.len() => self.small16.copy_from_slice(input),
+            Some(input) => return Err(format!("model input has {} values, expected {}", input.len(), self.small16.len())),
+            None => {
+                resample(&frame.data, w, h, &mut self.small, mw, mh, 3);
+                self.small16.convert_from_f32_slice(&self.small);
+            }
+        }
         let (a, b) = self.matte.run(&self.small16)?;
         let n = 4 * mw * mh;
         a.convert_to_f32_slice(&mut self.coef[..n]);

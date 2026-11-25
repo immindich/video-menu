@@ -344,6 +344,7 @@ impl GpuProcessor {
         src_stride: usize,
         width: usize,
         height: usize,
+        model_input: Option<&[f16]>,
         dst: &mut [u8],
         dst_stride: usize,
     ) -> Result<[Duration; 4], String> {
@@ -356,7 +357,7 @@ impl GpuProcessor {
             GpuEffect::ReplaceBackground(_, bg) => *bg,
         }).next();
         self.times = Times::default();
-        let wants_model = self.ingest(0, input, src, src_stride, width, height, background)?;
+        let wants_model = self.ingest(0, input, src, src_stride, width, height, background, model_input)?;
         // Take the effects out so they can be borrowed alongside `self`.
         let mut effects = std::mem::take(&mut self.effects);
         let result = (|| {
@@ -381,7 +382,8 @@ impl GpuProcessor {
     /// Upload a camera frame into `slot` and convert it to planar RGB there,
     /// ready for [`blur`](Self::blur) and [`finish`](Self::finish). With a
     /// `background` (an effect that runs the model), also make the model's
-    /// input, leave it in [`model_input`](Self::model_input) and return
+    /// input (unless `model_input` gives it already, e.g. from a scaled JPEG
+    /// decode), leave it in [`model_input`](Self::model_input) and return
     /// true. Waits only for the model input.
     #[allow(clippy::too_many_arguments)]
     pub fn ingest(
@@ -393,6 +395,7 @@ impl GpuProcessor {
         width: usize,
         height: usize,
         background: Option<Background>,
+        model_input: Option<&[f16]>,
     ) -> Result<bool, String> {
         if !width.is_multiple_of(2) || !pipeline::frame_fits(input, src.len(), src_stride, width, height) {
             return Err(format!("short or odd-sized frame ({} bytes)", src.len()));
@@ -430,7 +433,13 @@ impl GpuProcessor {
         // The model's input first, straight from the camera's bytes, and its
         // readback; then the full-resolution unpack, which runs while the
         // model input is read back and the model works.
-        let model_input = background.map(|_| {
+        if let (Some(_), Some(given)) = (background, model_input) {
+            if given.len() != self.small_host.len() {
+                return Err(format!("model input has {} values, expected {}", given.len(), self.small_host.len()));
+            }
+            self.small_host.copy_from_slice(given);
+        }
+        let model_input = background.filter(|_| model_input.is_none()).map(|_| {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             let (mw, mh) = self.model_size;
             let (downsample, name) = match input {
@@ -454,7 +463,7 @@ impl GpuProcessor {
         self.queue.submit([encoder.finish()]);
         self.submitted("unpack");
         let Some((index, bytes)) = model_input else {
-            return Ok(false);
+            return Ok(background.is_some());
         };
         self.wait_mapped(&self.small_readback, bytes, index)?;
         self.times.gpu += t.elapsed();
@@ -742,9 +751,7 @@ fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> [wgpu::Buffer
     use wgpu::BufferUsages as U;
     let small_bytes = (3 * w * h * 2) as u64;
     [
-        // Written by `downsample`, or uploaded when the model input was made
-        // on the CPU.
-        buffer("small", small_bytes, U::STORAGE | U::COPY_SRC | U::COPY_DST),
+        buffer("small", small_bytes, U::STORAGE | U::COPY_SRC),
         buffer("small readback", small_bytes, U::MAP_READ | U::COPY_DST),
         buffer("coef", (8 * w * h * 2) as u64, U::STORAGE | U::COPY_DST),
         buffer("coef4", (8 * w * h * 4) as u64, U::STORAGE),
@@ -793,7 +800,7 @@ mod tests {
                         })
                         .collect();
                     let bg = Some(Background::Color([0.0; 3]));
-                    assert!(gpu.ingest(0, format, &src, stride, w, h, bg).unwrap());
+                    assert!(gpu.ingest(0, format, &src, stride, w, h, bg, None).unwrap());
                     let got = gpu.model_input().to_vec();
                     let mut dst = vec![0u8; w * 2 * h];
                     let (a, b) = (vec![f16::ZERO; 4 * mw * mh], vec![f16::ZERO; 4 * mw * mh]);

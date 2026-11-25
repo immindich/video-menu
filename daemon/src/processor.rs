@@ -88,11 +88,13 @@ pub struct Processor {
     jpeg: Option<turbojpeg::Decompressor>,
     /// The last decoded MJPG frame, as RGBx.
     decoded: Vec<u8>,
+    /// Makes the model's input from MJPG frames, before the full decode.
+    early: EarlyInput,
 }
 
 impl Processor {
     fn with_backend(backend: Backend) -> Self {
-        Self { backend, jpeg: None, decoded: Vec::new() }
+        Self { backend, jpeg: None, decoded: Vec::new(), early: EarlyInput::default() }
     }
 
     pub fn cpu(effects: Effects) -> Self {
@@ -194,17 +196,24 @@ impl Processor {
         dst: &mut [u8],
         dst_stride: usize,
     ) -> Result<[Duration; 5], String> {
+        let mut early = false;
         let (input, src, src_stride, decode) = match format {
             FrameFormat::Raw(input) => (input, src, src_stride, Duration::ZERO),
             FrameFormat::Mjpg => {
                 let start = Instant::now();
+                // The model's input first, from a scaled-down decode, so a
+                // pipelined model can start before the full decode.
+                if let Some(size) = self.model_size() {
+                    early = self.early.make(src, (width, height), size)?;
+                }
                 self.decode_jpeg(src, width, height)?;
                 let rgbx = InputFormat::from_video_format(VideoFormat::RGBx).unwrap();
                 (rgbx, self.decoded.as_slice(), width * 4, start.elapsed())
             }
         };
+        let model_input = early.then_some(self.early.input.as_slice());
         let [a, b, model, c] = match &mut self.backend {
-            Backend::Gpu(gpu) => gpu.process(input, src, src_stride, width, height, dst, dst_stride)?,
+            Backend::Gpu(gpu) => gpu.process(input, src, src_stride, width, height, model_input, dst, dst_stride)?,
             Backend::Cpu(cpu) => {
                 let t0 = Instant::now();
                 cpu.planar.resize(width, height);
@@ -214,7 +223,7 @@ impl Processor {
                 let t1 = Instant::now();
                 let mut model = Duration::ZERO;
                 for effect in &mut cpu.effects {
-                    effect.apply(&mut cpu.planar)?;
+                    effect.apply_with_input(&mut cpu.planar, model_input)?;
                     model += effect.model_time();
                 }
                 let t2 = Instant::now();
@@ -223,6 +232,14 @@ impl Processor {
             }
         };
         Ok([decode, a, b, model, c])
+    }
+
+    /// The resolution of the model the effects run, if any.
+    fn model_size(&mut self) -> Option<(usize, usize)> {
+        match &mut self.backend {
+            Backend::Cpu(cpu) => cpu.effects.iter().find_map(|e| e.model_size()),
+            Backend::Gpu(gpu) => gpu.matting_mut().map(|m| m.size()),
+        }
     }
 
     /// Decode a JPEG frame into `self.decoded` as RGBx, checking it is the
@@ -252,6 +269,68 @@ impl Processor {
         decoder
             .decompress(jpeg, image)
             .map_err(|e| format!("bad JPEG frame: {e}"))
+    }
+}
+
+/// Makes a model's input from a JPEG frame by decoding it scaled down:
+/// libjpeg-turbo scales in the DCT, skipping most of the decode, so the
+/// model can start long before the full-resolution decode is done.
+#[derive(Default)]
+struct EarlyInput {
+    decoder: Option<turbojpeg::Decompressor>,
+    rgbx: Vec<u8>,
+    frame: PlanarFrame,
+    small: Vec<f32>,
+    input: Vec<half::f16>,
+}
+
+impl EarlyInput {
+    /// The scale to decode a `size` frame at for a model of `model` size:
+    /// the smallest at least as big as the model, or `None` if only the
+    /// full size is.
+    fn scale(size: (usize, usize), model: (usize, usize)) -> Option<turbojpeg::ScalingFactor> {
+        turbojpeg::Decompressor::supported_scaling_factors()
+            .into_iter()
+            .filter(|f| f.num() < f.denom())
+            .filter(|f| f.scale(size.0) >= model.0 && f.scale(size.1) >= model.1)
+            .min_by(|a, b| (a.num() * b.denom()).cmp(&(b.num() * a.denom())))
+    }
+
+    /// Make the model input for a `size` JPEG frame in `self.input`.
+    /// Returns false if it can't be made smaller than a full decode (the
+    /// backend makes it from the full frame then).
+    fn make(&mut self, jpeg: &[u8], size: (usize, usize), model: (usize, usize)) -> Result<bool, String> {
+        let Some(factor) = Self::scale(size, model) else {
+            return Ok(false);
+        };
+        let decoder = match &mut self.decoder {
+            Some(decoder) => decoder,
+            None => self.decoder.insert(turbojpeg::Decompressor::new().map_err(|e| format!("JPEG decoder: {e}"))?),
+        };
+        decoder.set_scaling_factor(factor).map_err(|e| format!("JPEG decoder: {e}"))?;
+        let header = decoder.read_header(jpeg).map_err(|e| format!("bad JPEG frame: {e}"))?;
+        if (header.width, header.height) != size {
+            return Err(format!("JPEG frame is {}x{}, expected {}x{}", header.width, header.height, size.0, size.1));
+        }
+        let (w, h) = (factor.scale(size.0), factor.scale(size.1));
+        self.rgbx.resize(w * 4 * h, 0);
+        let image = turbojpeg::Image {
+            pixels: self.rgbx.as_mut_slice(),
+            width: w,
+            pitch: w * 4,
+            height: h,
+            format: turbojpeg::PixelFormat::RGBX,
+        };
+        decoder.decompress(jpeg, image).map_err(|e| format!("bad JPEG frame: {e}"))?;
+        let rgbx = InputFormat::from_video_format(VideoFormat::RGBx).unwrap();
+        self.frame.resize(w, h);
+        pipeline::unpack(rgbx, &self.rgbx, w * 4, &mut self.frame);
+        let (mw, mh) = model;
+        self.small.resize(3 * mw * mh, 0.0);
+        pipeline::resample(&self.frame.planes().concat(), w, h, &mut self.small, mw, mh, 3);
+        self.input.resize(self.small.len(), half::f16::ZERO);
+        half::slice::HalfFloatSliceExt::convert_from_f32_slice(self.input.as_mut_slice(), &self.small);
+        Ok(true)
     }
 }
 
@@ -527,6 +606,80 @@ mod tests {
                 eprintln!("model {mw}x{mh}, {name}: gpu {:.2} ms/frame", total.as_secs_f64() * 1e3 / FRAMES as f64);
             }
         }
+    }
+
+    #[test]
+    fn early_input_picks_the_smallest_scale_that_covers_the_model() {
+        let scale = |size, model| EarlyInput::scale(size, model).map(|f| (f.num(), f.denom()));
+        assert_eq!(scale((1920, 1080), (480, 270)), Some((1, 4)));
+        assert_eq!(scale((1280, 720), (480, 270)), Some((3, 8)));
+        assert_eq!(scale((640, 360), (480, 270)), Some((3, 4)));
+        assert_eq!(scale((1920, 1080), (256, 144)), Some((1, 4)));
+        // Nothing smaller than the frame itself covers the model.
+        assert_eq!(scale((200, 120), (480, 270)), None);
+    }
+
+    #[test]
+    fn mjpg_background_gpu_matches_cpu() {
+        use crate::model::fake::FakeMatte;
+        for bg in [GREEN, Background::Blur { radius: 2.0 }] {
+            let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(480, 270)), false), bg);
+            let Some(mut gpu) = gpu_with(fake()) else { return };
+            let mut cpu = Processor::cpu(fake());
+            // Early input from a 3/4 and a 1/2 scale decode.
+            for (w, h) in [(640, 360), (960, 540)] {
+                let mjpg = jpeg(&smooth_rgbx(w, h), w, h, 90, turbojpeg::Subsamp::Sub2x1);
+                let (mut a, mut b) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
+                for _ in 0..2 {
+                    cpu.process(FrameFormat::Mjpg, &mjpg, 0, w, h, &mut a, w * 2).unwrap();
+                    gpu.process(FrameFormat::Mjpg, &mjpg, 0, w, h, &mut b, w * 2).unwrap();
+                }
+                let worst = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+                assert!(worst <= 2, "{bg:?} {w}x{h}: GPU differs from CPU by up to {worst}");
+            }
+        }
+    }
+
+    /// How much the MJPG early input (a scaled-down decode) changes the
+    /// real model's result: `testimage.jpg` as MJPG (early input) against
+    /// the same frame decoded and passed as raw RGBx (the model input made
+    /// from the full frame), green background, on the GPU. Set
+    /// `VIDEO_MENU_TEST_OUT` to save both.
+    ///
+    ///     cargo test --release -- --ignored --nocapture early_input_matte
+    #[test]
+    #[ignore]
+    fn early_input_matte_matches_full_decode() {
+        let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../testimage.jpg")).expect("testimage.jpg");
+        let img = turbojpeg::decompress(&jpg, turbojpeg::PixelFormat::RGBX).unwrap();
+        let (w, h) = (img.width, img.height);
+        let choice = model::choice_from_env().unwrap();
+        let effects = || Effects::Background(Matting::new(model::load(choice, 0.5).unwrap().0, false), GREEN);
+        let run = |format: FrameFormat, src: &[u8], stride: usize| {
+            let mut proc = Processor::gpu(effects()).unwrap();
+            let mut dst = vec![0u8; w * 2 * h];
+            // A still image as a short clip, so the recurrent state settles.
+            for _ in 0..8 {
+                proc.process(format, src, stride, w, h, &mut dst, w * 2).unwrap();
+            }
+            dst
+        };
+        let early = run(FrameFormat::Mjpg, &jpg, 0);
+        let full = run(FrameFormat::Raw(rgbx()), &img.pixels, w * 4);
+        if let Ok(dir) = std::env::var("VIDEO_MENU_TEST_OUT") {
+            std::fs::write(format!("{dir}/early_{w}x{h}.yuv"), &early).unwrap();
+            std::fs::write(format!("{dir}/full_{w}x{h}.yuv"), &full).unwrap();
+        }
+        let diffs: Vec<u8> = early.iter().zip(&full).map(|(a, b)| a.abs_diff(*b)).collect();
+        let over = |t: u8| diffs.iter().filter(|&&d| d > t).count() as f64 * 100.0 / diffs.len() as f64;
+        let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / diffs.len() as f64;
+        eprintln!(
+            "{choice:?}, {w}x{h}: mean diff {mean:.3}, >8: {:.3}%, >32: {:.3}%, >64: {:.3}%, max {}",
+            over(8),
+            over(32),
+            over(64),
+            diffs.iter().max().unwrap()
+        );
     }
 
     /// Run the real model (chosen as in the daemon, with
