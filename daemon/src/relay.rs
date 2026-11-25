@@ -38,11 +38,14 @@ use spa::{
     utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, SpaTypes, result::SpaResult},
 };
 
-use video_menu_protocol::{EffectChoice, ModelChoice, Stats};
+use video_menu_protocol::{
+    BLUR_RADIUS_RANGE, DEFAULT_BACKGROUND_COLOR, DEFAULT_BLUR_RADIUS, EffectChoice, ModelChoice, Stats,
+};
 
 use crate::{
     formats::{self, CameraMode, CaptureFormat, serialize},
     pipeline::InputFormat,
+    pipeline::Background,
     processor::{Effects, FrameFormat, Processor},
 };
 
@@ -160,13 +163,6 @@ impl Timing {
     }
 }
 
-/// Moves frames from a real camera to a virtual one, flipping them on the way.
-///
-/// `input` captures from the real camera; `output` is the virtual camera node
-/// that applications read from. The camera is only captured from while an
-/// application is streaming from `output`. The relay may have no camera
-/// selected, in which case `output` advertises generic formats and produces
-/// no frames; see [`set_camera`](Self::set_camera).
 /// Settings that can change while the relay runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
@@ -177,26 +173,75 @@ pub struct Settings {
     pub reuse_matte: bool,
     /// Temporal smoothing of the selfie model's mask, 0..1.
     pub selfie_smoothing: f32,
+    /// The `color` effect's background, as sRGB bytes.
+    pub background_color: [u8; 3],
+    /// The `blur` effect's strength: see [`Background::Blur`].
+    pub blur_radius: f32,
 }
 
 impl Settings {
     /// The starting settings, from `VIDEO_MENU_EFFECT`,
-    /// `VIDEO_MENU_MATTE_MODEL`, `VIDEO_MENU_REUSE_MATTE` and
-    /// `VIDEO_MENU_SELFIE_SMOOTHING`.
+    /// `VIDEO_MENU_MATTE_MODEL`, `VIDEO_MENU_REUSE_MATTE`,
+    /// `VIDEO_MENU_SELFIE_SMOOTHING`, `VIDEO_MENU_BACKGROUND_COLOR` (as
+    /// `#rrggbb`) and `VIDEO_MENU_BLUR_RADIUS`.
     pub fn from_env() -> Result<Self, String> {
-        let effect = match std::env::var("VIDEO_MENU_EFFECT") {
-            Ok(s) if !s.is_empty() => s.parse()?,
-            _ => EffectChoice::default(),
+        let var = |name| std::env::var(name).ok().filter(|s| !s.is_empty());
+        let effect = match var("VIDEO_MENU_EFFECT") {
+            Some(s) => s.parse()?,
+            None => EffectChoice::default(),
+        };
+        let background_color = match var("VIDEO_MENU_BACKGROUND_COLOR") {
+            Some(s) => parse_color(&s).ok_or_else(|| {
+                format!("VIDEO_MENU_BACKGROUND_COLOR must look like #00b140, not {s:?}")
+            })?,
+            None => DEFAULT_BACKGROUND_COLOR.into(),
+        };
+        let blur_radius = match var("VIDEO_MENU_BLUR_RADIUS") {
+            Some(s) => s
+                .parse()
+                .ok()
+                .filter(|r| BLUR_RADIUS_RANGE.contains(r))
+                .ok_or_else(|| format!("VIDEO_MENU_BLUR_RADIUS must be a number in {BLUR_RADIUS_RANGE:?}, not {s:?}"))?,
+            None => DEFAULT_BLUR_RADIUS,
         };
         Ok(Self {
             effect,
             model: crate::model::choice_from_env()?,
-            reuse_matte: std::env::var("VIDEO_MENU_REUSE_MATTE").as_deref() == Ok("1"),
+            reuse_matte: var("VIDEO_MENU_REUSE_MATTE").as_deref() == Some("1"),
             selfie_smoothing: crate::model::smoothing_from_env()?,
+            background_color,
+            blur_radius: blur_radius as f32,
         })
+    }
+
+    /// What the effect puts behind the person, or `None` if it doesn't
+    /// replace the background.
+    pub fn background(&self) -> Option<Background> {
+        match self.effect {
+            EffectChoice::None => None,
+            EffectChoice::Blur => Some(Background::Blur { radius: self.blur_radius }),
+            EffectChoice::Color => Some(Background::Color(self.background_color.map(|c| c as f32 / 255.0))),
+        }
     }
 }
 
+/// Parse `#rrggbb` (the `#` is optional).
+fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// Moves frames from a real camera to a virtual one, applying the effects on the way.
+///
+/// `input` captures from the real camera; `output` is the virtual camera node
+/// that applications read from. The camera is only captured from while an
+/// application is streaming from `output`. The relay may have no camera
+/// selected, in which case `output` advertises generic formats and produces
+/// no frames; see [`set_camera`](Self::set_camera).
 pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
@@ -344,8 +389,21 @@ impl CameraRelay {
         self.apply(Settings { effect, ..self.settings() })
     }
 
-    /// Switch the matting model. Takes effect at once with the green screen,
-    /// and when it is next selected otherwise.
+    /// Change the `color` effect's background colour (sRGB).
+    pub fn set_background_color(&self, background_color: [u8; 3]) -> Result<(), String> {
+        self.apply(Settings { background_color, ..self.settings() })
+    }
+
+    /// Change how strongly the `blur` effect blurs.
+    pub fn set_blur_radius(&self, radius: f32) -> Result<(), String> {
+        if !BLUR_RADIUS_RANGE.contains(&(radius as f64)) {
+            return Err(format!("blur radius must be in {BLUR_RADIUS_RANGE:?}, not {radius}"));
+        }
+        self.apply(Settings { blur_radius: radius, ..self.settings() })
+    }
+
+    /// Switch the matting model. Takes effect at once with a background
+    /// effect, and when one is next selected otherwise.
     pub fn set_model(&self, model: ModelChoice) -> Result<(), String> {
         self.apply(Settings { model, ..self.settings() })
     }
@@ -372,18 +430,25 @@ impl CameraRelay {
     }
 
     /// Rebuild the effects if `new` needs different ones, then record it.
+    /// Changing only the background (blur or colour, and their settings)
+    /// keeps the loaded model and takes effect from the next frame.
     fn apply(&self, new: Settings) -> Result<(), String> {
         let old = self.settings();
-        let rebuild = new.effect != old.effect
-            || (new.effect == EffectChoice::GreenScreen && new.model != old.model);
+        let matte = new.effect.needs_matte();
+        let rebuild = matte != old.effect.needs_matte() || (matte && new.model != old.model);
         if rebuild {
             // Load before touching the running pipeline, so a failure (e.g. a
             // missing model file) leaves it as it was.
             let (effects, description) =
-                Effects::load(new.effect, new.model, new.reuse_matte, new.selfie_smoothing)?;
+                Effects::load(new.background(), new.model, new.reuse_matte, new.selfie_smoothing)?;
             self.stop_capture();
             self.processor.borrow_mut().set_effects(effects);
             eprintln!("relay: now {description}");
+        } else if let Some(background) = new.background()
+            && new.background() != old.background()
+        {
+            self.processor.borrow_mut().set_background(background);
+            eprintln!("relay: background now {background:?}");
         }
         *self.settings.borrow_mut() = new;
         if rebuild {

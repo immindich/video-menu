@@ -8,7 +8,7 @@ mod preview;
 mod relay;
 
 use eframe::egui;
-use video_menu_protocol::{EffectChoice, ModelChoice};
+use video_menu_protocol::{BLUR_RADIUS_RANGE, EffectChoice, ModelChoice};
 
 use preview::Preview;
 use relay::{Command, RelayClient, RelayState};
@@ -34,6 +34,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(App {
                 relay,
                 smoothing_edit: None,
+                blur_edit: Pending::default(),
+                color_edit: Pending::default(),
                 preview,
                 texture: None,
                 frames: FrameCounter::default(),
@@ -47,11 +49,36 @@ struct App {
     /// The smoothing slider's value while it is being dragged; sent to the
     /// daemon when the drag ends, rather than on every frame of it.
     smoothing_edit: Option<f64>,
+    /// Blur radius and background colour the user picked, which the daemon
+    /// may not report yet. These are sent as they change (while dragging),
+    /// so they're shown instead of the daemon's values until it catches up.
+    blur_edit: Pending<f32>,
+    color_edit: Pending<[u8; 3]>,
     /// The live preview, while it is switched on.
     preview: Option<Preview>,
     /// The latest preview frame on the GPU.
     texture: Option<egui::TextureHandle>,
     frames: FrameCounter,
+}
+
+/// A value the user set that the daemon may not report yet.
+struct Pending<T>(Option<T>);
+
+impl<T> Default for Pending<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T: Copy + PartialEq> Pending<T> {
+    /// What to show, given what the daemon reports: the pending value until
+    /// the daemon reports it (or reports an error instead).
+    fn show(&mut self, actual: T, failed: bool) -> T {
+        if failed || self.0 == Some(actual) {
+            self.0 = None;
+        }
+        self.0.unwrap_or(actual)
+    }
 }
 
 /// Counts preview frames to show the rate they arrive at.
@@ -114,8 +141,13 @@ impl App {
             ui.end_row();
 
             ui.label("Effect");
-            ui.horizontal(|ui| {
-                for (effect, text) in [(EffectChoice::GreenScreen, "Green screen"), (EffectChoice::Flip, "Flip")] {
+            ui.vertical(|ui| {
+                let effects = [
+                    (EffectChoice::None, "None"),
+                    (EffectChoice::Blur, "Blur background"),
+                    (EffectChoice::Color, "Solid color background"),
+                ];
+                for (effect, text) in effects {
                     if ui.radio(state.effect == Some(effect), text).clicked() {
                         self.relay.send(Command::Effect(effect));
                     }
@@ -123,9 +155,35 @@ impl App {
             });
             ui.end_row();
 
-            let green = state.effect == Some(EffectChoice::GreenScreen);
+            let failed = state.error.is_some();
+            ui.label("Blur");
+            ui.add_enabled_ui(state.effect == Some(EffectChoice::Blur), |ui| {
+                let mut radius = self.blur_edit.show(state.blur_radius as f32, failed);
+                let range = *BLUR_RADIUS_RANGE.start() as f32..=*BLUR_RADIUS_RANGE.end() as f32;
+                if ui
+                    .add(egui::Slider::new(&mut radius, range).logarithmic(true).fixed_decimals(2).suffix(" %"))
+                    .on_hover_text("How far the background is smeared, as a share of the picture's height")
+                    .changed()
+                {
+                    self.blur_edit.0 = Some(radius);
+                    self.relay.send(Command::BlurRadius(radius as f64));
+                }
+            });
+            ui.end_row();
+
+            ui.label("Color");
+            ui.add_enabled_ui(state.effect == Some(EffectChoice::Color), |ui| {
+                let mut color = self.color_edit.show(state.background_color, failed);
+                if ui.color_edit_button_srgb(&mut color).changed() {
+                    self.color_edit.0 = Some(color);
+                    self.relay.send(Command::BackgroundColor(color));
+                }
+            });
+            ui.end_row();
+
+            let matte = state.effect.is_some_and(EffectChoice::needs_matte);
             ui.label("Model");
-            ui.add_enabled_ui(green, |ui| {
+            ui.add_enabled_ui(matte, |ui| {
                 ui.horizontal(|ui| {
                     for (model, text) in [(ModelChoice::Rvm, "RVM"), (ModelChoice::Selfie, "Selfie")] {
                         if ui.radio(state.model == Some(model), text).clicked() {
@@ -137,7 +195,7 @@ impl App {
             ui.end_row();
 
             ui.label("");
-            ui.add_enabled_ui(green, |ui| {
+            ui.add_enabled_ui(matte, |ui| {
                 let mut reuse = state.reuse_matte;
                 if ui
                     .checkbox(&mut reuse, "Reuse previous matte")
@@ -150,7 +208,7 @@ impl App {
             ui.end_row();
 
             ui.label("Smoothing");
-            let selfie = green && state.model == Some(ModelChoice::Selfie);
+            let selfie = matte && state.model == Some(ModelChoice::Selfie);
             ui.add_enabled_ui(selfie, |ui| {
                 let mut value = self.smoothing_edit.unwrap_or(state.selfie_smoothing);
                 let response = ui

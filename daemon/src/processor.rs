@@ -10,54 +10,57 @@ use std::time::{Duration, Instant};
 
 use pipewire::spa::param::video::VideoFormat;
 
-use video_menu_protocol::{EffectChoice, ModelChoice};
+use video_menu_protocol::ModelChoice;
 
 use crate::{
     gpu::{GpuEffect, GpuProcessor},
     model::{self, Matting},
-    pipeline::{self, Effect, GreenScreen, InputFormat, PlanarFrame, VerticalFlip},
+    pipeline::{self, Background, Effect, InputFormat, PlanarFrame, ReplaceBackground},
 };
 
 /// What to do to each frame.
 pub enum Effects {
-    /// Flip upside down; a cheap stand-in for testing.
-    Flip,
-    /// Replace the background with green using a matting model.
-    GreenScreen(Matting),
+    /// Nothing: frames pass through unchanged.
+    None,
+    /// Replace the background, finding it with a matting model.
+    Background(Matting, Background),
 }
 
 impl Effects {
     /// The effects for `effect`, loading the matting model if it needs one.
+    /// `background` is what a background effect starts out with.
     pub fn load(
-        effect: EffectChoice,
+        background: Option<Background>,
         model: ModelChoice,
         reuse: bool,
         smoothing: f32,
     ) -> Result<(Self, String), String> {
-        match effect {
-            EffectChoice::Flip => Ok((Self::Flip, "flip".into())),
-            EffectChoice::GreenScreen => {
-                let (matte, description) = model::load(model, smoothing)?;
-                let reuse_note = if reuse { ", reusing each matte for the next frame" } else { "" };
-                Ok((
-                    Self::GreenScreen(Matting::new(matte, reuse)),
-                    format!("green screen with {description}{reuse_note}"),
-                ))
-            }
-        }
+        let Some(background) = background else {
+            return Ok((Self::None, "none".into()));
+        };
+        let (matte, description) = model::load(model, smoothing)?;
+        let reuse_note = if reuse { ", reusing each matte for the next frame" } else { "" };
+        let what = match background {
+            Background::Color(_) => "solid colour background",
+            Background::Blur { .. } => "blurred background",
+        };
+        Ok((
+            Self::Background(Matting::new(matte, reuse), background),
+            format!("{what} with {description}{reuse_note}"),
+        ))
     }
 
     fn for_cpu(self) -> Vec<Box<dyn Effect>> {
         match self {
-            Self::Flip => vec![Box::new(VerticalFlip)],
-            Self::GreenScreen(matte) => vec![Box::new(GreenScreen::new(matte))],
+            Self::None => Vec::new(),
+            Self::Background(matte, bg) => vec![Box::new(ReplaceBackground::new(matte, bg))],
         }
     }
 
     fn for_gpu(self) -> Vec<GpuEffect> {
         match self {
-            Self::Flip => vec![GpuEffect::VerticalFlip],
-            Self::GreenScreen(matte) => vec![GpuEffect::GreenScreen(matte)],
+            Self::None => Vec::new(),
+            Self::Background(matte, bg) => vec![GpuEffect::ReplaceBackground(matte, bg)],
         }
     }
 }
@@ -141,6 +144,14 @@ impl Processor {
         match &mut self.backend {
             Backend::Cpu(cpu) => cpu.effects.iter_mut().find_map(|e| e.matting_mut()),
             Backend::Gpu(gpu) => gpu.matting_mut(),
+        }
+    }
+
+    /// Change what the background effect, if any, puts behind the person.
+    pub fn set_background(&mut self, background: Background) {
+        match &mut self.backend {
+            Backend::Cpu(cpu) => cpu.effects.iter_mut().for_each(|e| e.set_background(background)),
+            Backend::Gpu(gpu) => gpu.set_background(background),
         }
     }
 
@@ -294,7 +305,7 @@ mod tests {
     }
 
     fn gpu_or_skip() -> Option<Processor> {
-        gpu_with(Effects::Flip)
+        gpu_with(Effects::None)
     }
 
     fn gpu_with(effects: Effects) -> Option<Processor> {
@@ -318,7 +329,7 @@ mod tests {
     #[test]
     fn gpu_matches_cpu() {
         let Some(mut gpu) = gpu_or_skip() else { return };
-        let mut cpu = Processor::cpu(Effects::Flip);
+        let mut cpu = Processor::cpu(Effects::None);
         // Odd sizes in workgroup terms, and padded input rows.
         let (w, h) = (70, 37);
         let mut cases: Vec<(&str, FrameFormat, Vec<u8>, usize)> = raw_formats()
@@ -346,7 +357,7 @@ mod tests {
         let (w, h) = (64, 48);
         let px = smooth_rgbx(w, h);
         let mjpg = jpeg(&px, w, h, 100, turbojpeg::Subsamp::None);
-        let mut cpu = Processor::cpu(Effects::Flip);
+        let mut cpu = Processor::cpu(Effects::None);
         let (mut from_raw, mut from_jpeg) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
         let t = cpu.process(FrameFormat::Raw(rgbx()), &px, w * 4, w, h, &mut from_raw, w * 2).unwrap();
         assert_eq!(t[0], Duration::ZERO, "raw frames have no decode stage");
@@ -359,7 +370,7 @@ mod tests {
     fn mjpg_rejects_bad_frames() {
         let (w, h) = (32, 16);
         let mjpg = jpeg(&smooth_rgbx(w, h), w, h, 90, turbojpeg::Subsamp::Sub2x1);
-        let mut cpu = Processor::cpu(Effects::Flip);
+        let mut cpu = Processor::cpu(Effects::None);
         let mut dst = vec![0u8; 64 * 2 * 16];
         let err = cpu.process(FrameFormat::Mjpg, &mjpg, 0, 64, 16, &mut dst, 128).unwrap_err();
         assert!(err.contains("32x16"), "{err}");
@@ -394,7 +405,7 @@ mod tests {
     fn bench_cpu_vs_gpu() {
         const FRAMES: u32 = 100;
         let (w, h) = (1920, 1080);
-        let mut backends = vec![("CPU", Processor::cpu(Effects::Flip))];
+        let mut backends = vec![("CPU", Processor::cpu(Effects::None))];
         backends.extend(gpu_or_skip().map(|g| ("GPU", g)));
         let mut dst = vec![0u8; w * 2 * h];
         let mjpg = bench_jpeg(w, h);
@@ -431,20 +442,42 @@ mod tests {
         }
     }
 
+    const GREEN: Background = Background::Color([0.0, 177.0 / 255.0, 64.0 / 255.0]);
+
     #[test]
-    fn green_screen_gpu_matches_cpu() {
+    fn background_gpu_matches_cpu() {
         use crate::model::fake::FakeMatte;
-        // RVM's and MODNet's model resolutions.
-        for (mw, mh) in [(480, 270), (512, 288)] {
-            let fake = || Effects::GreenScreen(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false));
+        // RVM's and the selfie model's resolutions, with each background
+        // (including a blur strong enough to clamp at the frame's edges).
+        let cases = [
+            ((480, 270), GREEN),
+            ((256, 144), GREEN),
+            ((480, 270), Background::Blur { radius: 2.0 }),
+            ((256, 144), Background::Blur { radius: 8.0 }),
+        ];
+        for ((mw, mh), bg) in cases {
+            let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false), bg);
             let Some(gpu) = gpu_with(fake()) else { return };
-            green_screen_matches(gpu, Processor::cpu(fake()), (mw, mh));
+            background_matches(gpu, Processor::cpu(fake()), (mw, mh), bg);
         }
     }
 
-    fn green_screen_matches(mut gpu: Processor, mut cpu: Processor, (mw, mh): (usize, usize)) {
-        // Not the model's aspect ratio, and not a multiple of the workgroup.
-        for (w, h) in [(200, 120), (70, 37)] {
+    #[test]
+    fn background_can_change_in_place() {
+        use crate::model::fake::FakeMatte;
+        let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(256, 144)), false), GREEN);
+        let Some(mut gpu) = gpu_with(fake()) else { return };
+        let mut cpu = Processor::cpu(fake());
+        let blur = Background::Blur { radius: 3.0 };
+        gpu.set_background(blur);
+        cpu.set_background(blur);
+        background_matches(gpu, cpu, (256, 144), blur);
+    }
+
+    fn background_matches(mut gpu: Processor, mut cpu: Processor, (mw, mh): (usize, usize), bg: Background) {
+        // Not the model's aspect ratio, and not a multiple of the workgroup;
+        // the last is tall enough that the blur scales it down (by 3).
+        for (w, h) in [(200, 120), (70, 37), (642, 722)] {
             let src = pattern(rgbx(), w, h, w * 4);
             let (mut a, mut b) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
             cpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut a, w * 2).unwrap();
@@ -452,7 +485,7 @@ mod tests {
             let diffs: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).collect();
             let worst = *diffs.iter().max().unwrap();
             let off = diffs.iter().filter(|&&d| d > 0).count();
-            eprintln!("model {mw}x{mh}, frame {w}x{h}: {off} of {} bytes differ, by up to {worst}", a.len());
+            eprintln!("model {mw}x{mh}, {bg:?}, frame {w}x{h}: {off} of {} bytes differ, by up to {worst}", a.len());
             // The model input is f16, which the GPU and CPU may round
             // differently in the last bit; allow that to show through.
             assert!(worst <= 2, "{w}x{h}: GPU differs from CPU by up to {worst}");
@@ -469,20 +502,26 @@ mod tests {
     #[test]
     #[ignore]
     fn real_model_on_testimage() {
-        const FRAMES: usize = 8;
         let jpg = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../testimage.jpg"))
             .expect("testimage.jpg");
         let header = turbojpeg::read_header(&jpg).unwrap();
         let (w, h) = (header.width, header.height);
         let choice = model::choice_from_env().unwrap();
-        let matte = || Effects::GreenScreen(Matting::new(model::load(choice, 0.5).unwrap().0, false));
+        for (label, bg) in [("color", GREEN), ("blur", Background::Blur { radius: 2.0 })] {
+            real_model_with(choice, label, bg, &jpg, (w, h));
+        }
+    }
+
+    fn real_model_with(choice: ModelChoice, label: &str, bg: Background, jpg: &[u8], (w, h): (usize, usize)) {
+        const FRAMES: usize = 8;
+        let matte = || Effects::Background(Matting::new(model::load(choice, 0.5).unwrap().0, false), bg);
         let mut outputs = Vec::new();
         for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
             let mut dst = vec![0u8; w * 2 * h];
             // A still image as a short clip, so the recurrent state settles.
             let mut last = [Duration::ZERO; 5];
             for _ in 0..FRAMES {
-                last = proc.process(FrameFormat::Mjpg, &jpg, 0, w, h, &mut dst, w * 2).unwrap();
+                last = proc.process(FrameFormat::Mjpg, jpg, 0, w, h, &mut dst, w * 2).unwrap();
             }
             let stages: Vec<String> = proc
                 .stage_names()
@@ -490,16 +529,16 @@ mod tests {
                 .zip(last)
                 .map(|(n, t)| format!("{n} {:.2}", t.as_secs_f64() * 1e3))
                 .collect();
-            eprintln!("{name}: last frame {}", stages.join(", "));
+            eprintln!("{label} {name}: last frame {}", stages.join(", "));
             if let Ok(dir) = std::env::var("VIDEO_MENU_TEST_OUT") {
-                std::fs::write(format!("{dir}/green_{name}_{w}x{h}.yuv"), &dst).unwrap();
+                std::fs::write(format!("{dir}/{label}_{name}_{w}x{h}.yuv"), &dst).unwrap();
             }
             outputs.push(dst);
         }
         let diffs: Vec<u8> = outputs[0].iter().zip(&outputs[1]).map(|(a, b)| a.abs_diff(*b)).collect();
         let big = diffs.iter().filter(|&&d| d > 8).count();
         eprintln!(
-            "cpu vs gpu: max diff {}, {} of {} bytes differ by more than 8",
+            "{label} cpu vs gpu: max diff {}, {} of {} bytes differ by more than 8",
             diffs.iter().max().unwrap(),
             big,
             diffs.len()

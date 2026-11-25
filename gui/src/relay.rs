@@ -24,6 +24,8 @@ pub struct RelayState {
     pub sources: Vec<(String, bool)>,
     pub model: Option<ModelChoice>,
     pub effect: Option<EffectChoice>,
+    pub background_color: [u8; 3],
+    pub blur_radius: f64,
     pub reuse_matte: bool,
     pub selfie_smoothing: f64,
     pub stats: Stats,
@@ -37,6 +39,8 @@ pub enum Command {
     Camera(String),
     Model(ModelChoice),
     Effect(EffectChoice),
+    BackgroundColor([u8; 3]),
+    BlurRadius(f64),
     ReuseMatte(bool),
     SelfieSmoothing(f64),
 }
@@ -82,8 +86,10 @@ fn run(state: Arc<Mutex<RelayState>>, commands: mpsc::Receiver<Command>, repaint
             continue;
         };
         if let Some(command) = command {
-            let result = zbus::block_on(apply(relay, command));
-            update(&state, &repaint, |s| s.error = result.err());
+            for command in coalesce(command, &commands) {
+                let result = zbus::block_on(apply(relay, command));
+                update(&state, &repaint, |s| s.error = result.err());
+            }
         }
         match zbus::block_on(read(relay)) {
             Ok(mut fresh) => update(&state, &repaint, |s| {
@@ -101,6 +107,19 @@ fn run(state: Arc<Mutex<RelayState>>, commands: mpsc::Receiver<Command>, repaint
             }
         }
     }
+}
+
+/// `first` and any commands queued behind it, keeping only the last of each
+/// kind: dragging a slider or colour picker sends a command per frame, and
+/// only where it ends up matters.
+fn coalesce(first: Command, queued: &mpsc::Receiver<Command>) -> Vec<Command> {
+    let mut latest: Vec<Command> = Vec::new();
+    for command in std::iter::once(first).chain(queued.try_iter()) {
+        let kind = std::mem::discriminant(&command);
+        latest.retain(|c| std::mem::discriminant(c) != kind);
+        latest.push(command);
+    }
+    latest
 }
 
 /// Change the shared state with `f`, repainting if it changed.
@@ -130,6 +149,8 @@ async fn read(relay: &RelayProxy<'_>) -> zbus::Result<RelayState> {
         sources: relay.sources().await?,
         model: relay.model().await?.parse().ok(),
         effect: relay.effect().await?.parse().ok(),
+        background_color: relay.background_color().await?.into(),
+        blur_radius: relay.blur_radius().await?,
         reuse_matte: relay.reuse_matte().await?,
         selfie_smoothing: relay.selfie_smoothing().await?,
         stats: relay.stats().await?,
@@ -142,6 +163,8 @@ async fn apply(relay: &RelayProxy<'_>, command: Command) -> Result<(), String> {
         Command::Camera(name) => relay.set_camera(&name).await,
         Command::Model(model) => relay.set_model(model.as_str()).await,
         Command::Effect(effect) => relay.set_effect(effect.as_str()).await,
+        Command::BackgroundColor(color) => relay.set_background_color(color.into()).await,
+        Command::BlurRadius(radius) => relay.set_blur_radius(radius).await,
         Command::ReuseMatte(reuse) => relay.set_reuse_matte(reuse).await,
         Command::SelfieSmoothing(strength) => relay.set_selfie_smoothing(strength).await,
     };
@@ -150,4 +173,22 @@ async fn apply(relay: &RelayProxy<'_>, command: Command) -> Result<(), String> {
         zbus::Error::MethodError(_, Some(message), _) => message,
         e => e.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_keeps_the_last_of_each_kind_in_order() {
+        let (tx, rx) = mpsc::channel();
+        for c in [Command::BlurRadius(2.0), Command::ReuseMatte(true), Command::BlurRadius(3.0)] {
+            tx.send(c).unwrap();
+        }
+        let got = coalesce(Command::BlurRadius(1.0), &rx);
+        assert!(
+            matches!(got.as_slice(), [Command::ReuseMatte(true), Command::BlurRadius(r)] if *r == 3.0),
+            "{got:?}"
+        );
+    }
 }

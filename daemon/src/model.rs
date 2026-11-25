@@ -4,8 +4,8 @@
 //! ([`Matte::size`]), and returns per-pixel coefficients `A` and `b` (4
 //! channels each: foreground residual R, G, B and alpha) at that resolution.
 //! The caller upsamples them to the frame's resolution and computes
-//! `A * [R, G, B, gray] + b` there; see [`crate::pipeline::GreenScreen`] and
-//! `green_screen` in `pipeline.wgsl`. Two models are available:
+//! `A * [R, G, B, gray] + b` there; see [`crate::pipeline::ReplaceBackground`]
+//! and `matte_at` in `pipeline.wgsl`. Two models are available:
 //!
 //! - [`RvmMatte`]: RobustVideoMatting without its full-resolution refiner
 //!   stage (see `tools/split_refiner.py`). The network itself produces `A`

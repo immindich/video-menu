@@ -21,8 +21,17 @@ struct Params {
     small_h: u32,
     _pad1: u32,
     _pad2: u32,
-    // Background colour for green_screen.
+    // Background colour for composite_color.
     bg: vec4<f32>,
+    // The blur's scaled-down copy (see BlurGeometry in pipeline.rs).
+    blur_w: u32,
+    blur_h: u32,
+    blur_factor: u32,
+    blur_taps: u32,
+    blur_sigma: f32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -34,6 +43,10 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> small: array<u32>;
 // The model's coefficients A then b: eight planes of f16 at model resolution.
 @group(0) @binding(5) var<storage, read> coef: array<u32>;
+// The blur's two scaled-down buffers, each four planes (weighted R, G, B,
+// then the weight) of blur_w*blur_h. Passes go a -> b -> a.
+@group(0) @binding(6) var<storage, read_write> blur_a: array<f32>;
+@group(0) @binding(7) var<storage, read_write> blur_b: array<f32>;
 
 fn byte_at(word: u32, shift: u32) -> f32 {
     return f32((word >> shift) & 0xffu);
@@ -118,7 +131,7 @@ fn pack_yuy2(@builtin(global_invocation_id) id: vec3<u32>) {
     dst[id.y * p.dst_words + id.x] = luma(a) | (u << 8u) | (luma(b) << 16u) | (v << 24u);
 }
 
-// ---- matting (see GreenScreen in pipeline.rs) ----
+// ---- matting (see ReplaceBackground in pipeline.rs) ----
 
 struct Tap {
     i0: u32,
@@ -176,22 +189,149 @@ fn sample_coef(k: u32, tx: Tap, ty: Tap) -> f32 {
     return left * (1.0 - tx.w) + right * tx.w;
 }
 
-// One invocation per pixel: upsample the coefficients, apply them to the
-// pixel to get its foreground colour and alpha, and composite over bg.
+struct Matte {
+    fgr: vec3<f32>,
+    pha: f32,
+}
+
+// Upsample the coefficients to pixel i at (x, y) and apply them to its
+// colour, giving its foreground colour and alpha.
+fn matte_at(x: u32, y: u32) -> Matte {
+    let tx = tap(x, p.small_w, p.width);
+    let ty = tap(y, p.small_h, p.height);
+    let rgb = load_rgb(y * p.width + x);
+    let v = vec4<f32>(rgb, (rgb.r + rgb.g + rgb.b) * (1.0 / 3.0));
+    let a = vec4<f32>(sample_coef(0u, tx, ty), sample_coef(1u, tx, ty), sample_coef(2u, tx, ty), sample_coef(3u, tx, ty));
+    let b = vec4<f32>(sample_coef(4u, tx, ty), sample_coef(5u, tx, ty), sample_coef(6u, tx, ty), sample_coef(7u, tx, ty));
+    let out = a * v + b;
+    return Matte(clamp(out.rgb + rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(out.a, 0.0, 1.0));
+}
+
+// Just the alpha of matte_at, computed as the CPU does (from the gray
+// channel's coefficients only).
+fn alpha_at(x: u32, y: u32) -> f32 {
+    let tx = tap(x, p.small_w, p.width);
+    let ty = tap(y, p.small_h, p.height);
+    let rgb = load_rgb(y * p.width + x);
+    let gray = (rgb.r + rgb.g + rgb.b) * (1.0 / 3.0);
+    return clamp(sample_coef(3u, tx, ty) * gray + sample_coef(7u, tx, ty), 0.0, 1.0);
+}
+
+// One invocation per pixel: composite the foreground over p.bg.
 @compute @workgroup_size(16, 16)
-fn green_screen(@builtin(global_invocation_id) id: vec3<u32>) {
+fn composite_color(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= p.width || id.y >= p.height) {
         return;
     }
-    let tx = tap(id.x, p.small_w, p.width);
-    let ty = tap(id.y, p.small_h, p.height);
-    let i = id.y * p.width + id.x;
-    let rgb = load_rgb(i);
-    let x = vec4<f32>(rgb, (rgb.r + rgb.g + rgb.b) * (1.0 / 3.0));
-    let a = vec4<f32>(sample_coef(0u, tx, ty), sample_coef(1u, tx, ty), sample_coef(2u, tx, ty), sample_coef(3u, tx, ty));
-    let b = vec4<f32>(sample_coef(4u, tx, ty), sample_coef(5u, tx, ty), sample_coef(6u, tx, ty), sample_coef(7u, tx, ty));
-    let out = a * x + b;
-    let pha = clamp(out.a, 0.0, 1.0);
-    let fgr = clamp(out.rgb + rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    store_rgb(i, fgr * pha + p.bg.rgb * (1.0 - pha));
+    let m = matte_at(id.x, id.y);
+    store_rgb(id.y * p.width + id.x, m.fgr * m.pha + p.bg.rgb * (1.0 - m.pha));
+}
+
+// ---- background blur (see blur_down, blur_pass in pipeline.rs) ----
+
+const BLUR_FOREGROUND_WEIGHT: f32 = 0.01;
+
+// One invocation per blur sample: the block average of colour weighted by
+// how much each pixel is background, and of the weights, into blur_a.
+@compute @workgroup_size(16, 16)
+fn blur_down(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p.blur_w || id.y >= p.blur_h) {
+        return;
+    }
+    let x0 = id.x * p.blur_factor;
+    let y0 = id.y * p.blur_factor;
+    let x1 = min(x0 + p.blur_factor, p.width);
+    let y1 = min(y0 + p.blur_factor, p.height);
+    var sum = vec4<f32>(0.0);
+    for (var y = y0; y < y1; y++) {
+        for (var x = x0; x < x1; x++) {
+            let w = 1.0 - alpha_at(x, y) * (1.0 - BLUR_FOREGROUND_WEIGHT);
+            sum += vec4<f32>(load_rgb(y * p.width + x) * w, w);
+        }
+    }
+    let count = f32((x1 - x0) * (y1 - y0));
+    let n = p.blur_w * p.blur_h;
+    let i = id.y * p.blur_w + id.x;
+    for (var c = 0u; c < 4u; c++) {
+        blur_a[c * n + i] = sum[c] / count;
+    }
+}
+
+fn gauss(d: i32) -> f32 {
+    return exp(-f32(d * d) / (2.0 * p.blur_sigma * p.blur_sigma));
+}
+
+// Normalised Gaussian weight for offset d (matching gaussian() on the CPU,
+// which normalises by the kernel's sum).
+fn gauss_sum() -> f32 {
+    let t = i32(p.blur_taps);
+    var sum = 0.0;
+    for (var d = -t; d <= t; d++) {
+        sum += gauss(d);
+    }
+    return sum;
+}
+
+// One invocation per blur sample: blur_a -> blur_b along x.
+@compute @workgroup_size(16, 16)
+fn blur_h(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p.blur_w || id.y >= p.blur_h) {
+        return;
+    }
+    let n = p.blur_w * p.blur_h;
+    let t = i32(p.blur_taps);
+    let norm = 1.0 / gauss_sum();
+    let row = id.y * p.blur_w;
+    for (var c = 0u; c < 4u; c++) {
+        var sum = 0.0;
+        for (var d = -t; d <= t; d++) {
+            let x = u32(clamp(i32(id.x) + d, 0, i32(p.blur_w) - 1));
+            sum += gauss(d) * norm * blur_a[c * n + row + x];
+        }
+        blur_b[c * n + row + id.x] = sum;
+    }
+}
+
+// One invocation per blur sample: blur_b -> blur_a along y.
+@compute @workgroup_size(16, 16)
+fn blur_v(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p.blur_w || id.y >= p.blur_h) {
+        return;
+    }
+    let n = p.blur_w * p.blur_h;
+    let t = i32(p.blur_taps);
+    let norm = 1.0 / gauss_sum();
+    for (var c = 0u; c < 4u; c++) {
+        var sum = 0.0;
+        for (var d = -t; d <= t; d++) {
+            let y = u32(clamp(i32(id.y) + d, 0, i32(p.blur_h) - 1));
+            sum += gauss(d) * norm * blur_b[c * n + y * p.blur_w + id.x];
+        }
+        blur_a[c * n + id.y * p.blur_w + id.x] = sum;
+    }
+}
+
+fn blur_at(c: u32, x: u32, y: u32) -> f32 {
+    return blur_a[c * p.blur_w * p.blur_h + y * p.blur_w + x];
+}
+
+fn sample_blur(c: u32, tx: Tap, ty: Tap) -> f32 {
+    let left = blur_at(c, tx.i0, ty.i0) * (1.0 - ty.w) + blur_at(c, tx.i0, ty.i1) * ty.w;
+    let right = blur_at(c, tx.i1, ty.i0) * (1.0 - ty.w) + blur_at(c, tx.i1, ty.i1) * ty.w;
+    return left * (1.0 - tx.w) + right * tx.w;
+}
+
+// One invocation per pixel: composite the foreground over the blurred
+// background, sampled up from blur_a.
+@compute @workgroup_size(16, 16)
+fn composite_blur(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= p.width || id.y >= p.height) {
+        return;
+    }
+    let m = matte_at(id.x, id.y);
+    let tx = tap(id.x, p.blur_w, p.width);
+    let ty = tap(id.y, p.blur_h, p.height);
+    let blurred = vec4<f32>(sample_blur(0u, tx, ty), sample_blur(1u, tx, ty), sample_blur(2u, tx, ty), sample_blur(3u, tx, ty));
+    let bg = blurred.rgb / blurred.w;
+    store_rgb(id.y * p.width + id.x, m.fgr * m.pha + bg * (1.0 - m.pha));
 }

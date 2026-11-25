@@ -28,6 +28,8 @@ pub enum Request {
     Camera(String),
     Model(ModelChoice),
     Effect(EffectChoice),
+    BackgroundColor([u8; 3]),
+    BlurRadius(f32),
     ReuseMatte(bool),
     SelfieSmoothing(f32),
 }
@@ -52,6 +54,8 @@ pub struct Snapshot {
     pub sources: Vec<(String, bool)>,
     pub model: ModelChoice,
     pub effect: EffectChoice,
+    pub background_color: (u8, u8, u8),
+    pub blur_radius: f64,
     pub reuse_matte: bool,
     pub selfie_smoothing: f64,
     pub stats: Stats,
@@ -64,6 +68,8 @@ enum Change {
     Sources,
     Model,
     Effect,
+    BackgroundColor,
+    BlurRadius,
     ReuseMatte,
     SelfieSmoothing,
     Stats,
@@ -86,6 +92,8 @@ impl Service {
             (old.sources != new.sources, Change::Sources),
             (old.model != new.model, Change::Model),
             (old.effect != new.effect, Change::Effect),
+            (old.background_color != new.background_color, Change::BackgroundColor),
+            (old.blur_radius != new.blur_radius, Change::BlurRadius),
             (old.reuse_matte != new.reuse_matte, Change::ReuseMatte),
             (old.selfie_smoothing != new.selfie_smoothing, Change::SelfieSmoothing),
             (old.stats != new.stats, Change::Stats),
@@ -168,6 +176,8 @@ async fn serve(
             Change::Sources => relay.sources_changed(emitter).await,
             Change::Model => relay.model_changed(emitter).await,
             Change::Effect => relay.effect_changed(emitter).await,
+            Change::BackgroundColor => relay.background_color_changed(emitter).await,
+            Change::BlurRadius => relay.blur_radius_changed(emitter).await,
             Change::ReuseMatte => relay.reuse_matte_changed(emitter).await,
             Change::SelfieSmoothing => relay.selfie_smoothing_changed(emitter).await,
             Change::Stats => relay.stats_changed(emitter).await,
@@ -234,7 +244,7 @@ impl RelayInterface {
         self.call(Request::Model(model)).await
     }
 
-    /// Effect: "green" or "flip".
+    /// Effect: "none", "blur" or "color".
     #[zbus(property)]
     async fn effect(&self) -> String {
         self.read(|s| s.effect.to_string())
@@ -244,6 +254,29 @@ impl RelayInterface {
     async fn set_effect(&mut self, value: String) -> fdo::Result<()> {
         let effect = value.parse().map_err(fdo::Error::InvalidArgs)?;
         self.call(Request::Effect(effect)).await
+    }
+
+    /// The "color" effect's background, as sRGB bytes.
+    #[zbus(property)]
+    async fn background_color(&self) -> (u8, u8, u8) {
+        self.read(|s| s.background_color)
+    }
+
+    #[zbus(property)]
+    async fn set_background_color(&mut self, value: (u8, u8, u8)) -> fdo::Result<()> {
+        self.call(Request::BackgroundColor(value.into())).await
+    }
+
+    /// The "blur" effect's Gaussian standard deviation, in percent of the
+    /// frame height.
+    #[zbus(property)]
+    async fn blur_radius(&self) -> f64 {
+        self.read(|s| s.blur_radius)
+    }
+
+    #[zbus(property)]
+    async fn set_blur_radius(&mut self, value: f64) -> fdo::Result<()> {
+        self.call(Request::BlurRadius(value as f32)).await
     }
 
     /// Composite each frame with the previous frame's matte.

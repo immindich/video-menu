@@ -19,16 +19,16 @@ use half::f16;
 
 use crate::{
     model::Matting,
-    pipeline::{self, GREEN, InputFormat},
+    pipeline::{self, Background, BlurGeometry, InputFormat},
 };
 
 const WORKGROUP: u32 = 16;
 
 /// An effect that runs on the GPU.
 pub enum GpuEffect {
-    VerticalFlip,
-    /// Replace the background with green, using a matting model.
-    GreenScreen(Matting),
+    /// Replace the background, using a matting model to find the person
+    /// (see [`pipeline::ReplaceBackground`]).
+    ReplaceBackground(Matting, Background),
 }
 
 #[repr(C)]
@@ -46,6 +46,12 @@ struct Params {
     small_h: u32,
     _pad1: [u32; 2],
     bg: [f32; 4],
+    blur_w: u32,
+    blur_h: u32,
+    blur_factor: u32,
+    blur_taps: u32,
+    blur_sigma: f32,
+    _pad3: [u32; 3],
 }
 
 /// GPU buffers sized for one frame size; reallocated when it changes.
@@ -64,15 +70,18 @@ pub struct GpuProcessor {
     layout: wgpu::BindGroupLayout,
     unpack_packed: wgpu::ComputePipeline,
     unpack_yuy2: wgpu::ComputePipeline,
-    vertical_flip: wgpu::ComputePipeline,
     downsample: wgpu::ComputePipeline,
-    green_screen: wgpu::ComputePipeline,
+    composite_color: wgpu::ComputePipeline,
+    blur_down: wgpu::ComputePipeline,
+    blur_h: wgpu::ComputePipeline,
+    blur_v: wgpu::ComputePipeline,
+    composite_blur: wgpu::ComputePipeline,
     pack_yuy2: wgpu::ComputePipeline,
     params: wgpu::Buffer,
     /// The frame at model resolution (f16), written by `downsample`.
     small: wgpu::Buffer,
     small_readback: wgpu::Buffer,
-    /// The model's output (f16 A then b), read by `green_screen`.
+    /// The model's output (f16 A then b), read by the composite passes.
     coef: wgpu::Buffer,
     effects: Vec<GpuEffect>,
     frame: Option<Frame>,
@@ -149,6 +158,8 @@ impl GpuProcessor {
                 storage(3, false),
                 storage(4, false),
                 storage(5, true),
+                storage(6, false),
+                storage(7, false),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -182,9 +193,12 @@ impl GpuProcessor {
         Ok(Self {
             unpack_packed: pipeline("unpack_packed"),
             unpack_yuy2: pipeline("unpack_yuy2"),
-            vertical_flip: pipeline("vertical_flip"),
             downsample: pipeline("downsample"),
-            green_screen: pipeline("green_screen"),
+            composite_color: pipeline("composite_color"),
+            blur_down: pipeline("blur_down"),
+            blur_h: pipeline("blur_h"),
+            blur_v: pipeline("blur_v"),
+            composite_blur: pipeline("composite_blur"),
             pack_yuy2: pipeline("pack_yuy2"),
             params: buffer("params", size_of::<Params>() as u64, U::UNIFORM | U::COPY_DST),
             small,
@@ -204,10 +218,9 @@ impl GpuProcessor {
     }
 
     pub fn set_effects(&mut self, effects: Vec<GpuEffect>) {
-        let model_size = effects.iter().find_map(|e| match e {
-            GpuEffect::GreenScreen(matte) => Some(matte.size()),
-            GpuEffect::VerticalFlip => None,
-        });
+        let model_size = effects.iter().map(|e| match e {
+            GpuEffect::ReplaceBackground(matte, _) => matte.size(),
+        }).next();
         if let Some(size) = model_size
             && size != self.model_size
         {
@@ -227,18 +240,24 @@ impl GpuProcessor {
 
     /// The matting model the effects run, if any.
     pub fn matting_mut(&mut self) -> Option<&mut Matting> {
-        self.effects.iter_mut().find_map(|e| match e {
-            GpuEffect::GreenScreen(matte) => Some(matte),
-            GpuEffect::VerticalFlip => None,
-        })
+        self.effects.iter_mut().map(|e| match e {
+            GpuEffect::ReplaceBackground(matte, _) => matte,
+        }).next()
+    }
+
+    /// Change what the effects put behind the person.
+    pub fn set_background(&mut self, background: Background) {
+        for effect in &mut self.effects {
+            let GpuEffect::ReplaceBackground(_, bg) = effect;
+            *bg = background;
+        }
     }
 
     /// Forget effects' temporal state, e.g. after switching cameras.
     pub fn reset(&mut self) {
         for effect in &mut self.effects {
-            if let GpuEffect::GreenScreen(matte) = effect {
-                matte.reset();
-            }
+            let GpuEffect::ReplaceBackground(matte, _) = effect;
+            matte.reset();
         }
     }
 
@@ -283,6 +302,20 @@ impl GpuProcessor {
             InputFormat::Packed { r, g, b, .. } => (r, g, b),
             InputFormat::Yuy2 => (0, 0, 0),
         };
+        // Only one background effect runs, so its settings can live in
+        // the shared parameters.
+        let background = self.effects.iter().map(|e| match e {
+            GpuEffect::ReplaceBackground(_, bg) => *bg,
+        }).next();
+        let bg = match background {
+            Some(Background::Color(c)) => [c[0], c[1], c[2], 1.0],
+            _ => [0.0; 4],
+        };
+        let radius = match background {
+            Some(Background::Blur { radius }) => radius,
+            _ => 1.0,
+        };
+        let blur = BlurGeometry::new(width, height, radius);
         let params = Params {
             width: width as u32,
             height: height as u32,
@@ -295,7 +328,13 @@ impl GpuProcessor {
             small_w: self.model_size.0 as u32,
             small_h: self.model_size.1 as u32,
             _pad1: [0; 2],
-            bg: [GREEN[0], GREEN[1], GREEN[2], 1.0],
+            bg,
+            blur_w: blur.width as u32,
+            blur_h: blur.height as u32,
+            blur_factor: blur.factor as u32,
+            blur_taps: blur.taps as u32,
+            blur_sigma: blur.sigma,
+            _pad3: [0; 3],
         };
         self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let mut times = Times { upload: t0.elapsed(), gpu: Duration::ZERO, model: Duration::ZERO };
@@ -312,15 +351,21 @@ impl GpuProcessor {
         let mut result = Ok(());
         for effect in &mut effects {
             match effect {
-                GpuEffect::VerticalFlip => {
-                    self.dispatch(&mut encoder, &self.vertical_flip, w, h / 2);
-                }
-                GpuEffect::GreenScreen(matte) => {
+                GpuEffect::ReplaceBackground(matte, background) => {
                     result = self.run_model(&mut encoder, matte, &mut times);
                     if result.is_err() {
                         break;
                     }
-                    self.dispatch(&mut encoder, &self.green_screen, w, h);
+                    match background {
+                        Background::Color(_) => self.dispatch(&mut encoder, &self.composite_color, w, h),
+                        Background::Blur { .. } => {
+                            let (bw, bh) = (blur.width as u32, blur.height as u32);
+                            self.dispatch(&mut encoder, &self.blur_down, bw, bh);
+                            self.dispatch(&mut encoder, &self.blur_h, bw, bh);
+                            self.dispatch(&mut encoder, &self.blur_v, bw, bh);
+                            self.dispatch(&mut encoder, &self.composite_blur, w, h);
+                        }
+                    }
                 }
             }
         }
@@ -435,6 +480,11 @@ impl GpuProcessor {
         let planar = buffer("planar", pixels * 3 * 4, U::STORAGE);
         let output = buffer("output", pixels * 2, U::STORAGE | U::COPY_SRC);
         let readback = buffer("readback", pixels * 2, U::MAP_READ | U::COPY_DST);
+        // The blur's scaled-down size depends only on the frame's.
+        let geometry = BlurGeometry::new(width, height, 1.0);
+        let blur_bytes = (4 * geometry.width * geometry.height * 4) as u64;
+        let blur_a = buffer("blur a", blur_bytes, U::STORAGE);
+        let blur_b = buffer("blur b", blur_bytes, U::STORAGE);
         fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
         }
@@ -448,6 +498,8 @@ impl GpuProcessor {
                 entry(3, &output),
                 entry(4, &self.small),
                 entry(5, &self.coef),
+                entry(6, &blur_a),
+                entry(7, &blur_b),
             ],
         });
         self.frame = Some(Frame { width, height, input, output, readback, bind_group });
@@ -456,7 +508,7 @@ impl GpuProcessor {
 
 /// Buffers for a matting model working at `(w, h)`: the frame at that
 /// resolution (f16, written by `downsample`), its CPU readback copy, and the
-/// model's coefficients (f16 A then b, read by `green_screen`). The shaders
+/// model's coefficients (f16 A then b, read by the composite passes). The shaders
 /// pack two f16 per word, so `w` must be even.
 fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
     assert!(w.is_multiple_of(2), "model width must be even");

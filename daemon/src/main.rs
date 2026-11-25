@@ -1,9 +1,9 @@
 //! Virtual camera daemon.
 //!
 //! Exposes a PipeWire `Video/Source` node that mirrors a real webcam. Frames
-//! are converted to planar RGB, their background is replaced with green
-//! using a matting model (RVM, on the NPU), and they are offered to
-//! applications as YUY2. The real camera is only opened while some client
+//! are converted to planar RGB, optionally have their background blurred or
+//! replaced with a colour using a matting model (on the NPU), and are
+//! offered to applications as YUY2. The real camera is only opened while some client
 //! is actually streaming from the virtual node; otherwise it stays idle (and
 //! suspended).
 //!
@@ -20,7 +20,12 @@
 //! otherwise on the CPU; set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force one.
 //!
 //! Other settings:
-//! - `VIDEO_MENU_EFFECT=flip` flips frames instead of running the model.
+//! - `VIDEO_MENU_EFFECT` is `none` (default: frames pass through), `blur`
+//!   (blur the background) or `color` (replace it with a solid colour).
+//! - `VIDEO_MENU_BACKGROUND_COLOR` (`#rrggbb`, default `#00b140`) is the
+//!   `color` effect's colour.
+//! - `VIDEO_MENU_BLUR_RADIUS` (default 2) is the `blur` effect's strength:
+//!   the blur's standard deviation as a percentage of the frame height.
 //! - `VIDEO_MENU_MATTE_MODEL` chooses the matting model: `rvm` (default,
 //!   GPL-3.0) or `selfie` (MediaPipe's selfie segmenter, Apache-2.0; see
 //!   `model.rs`).
@@ -69,6 +74,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             effect: settings.effect,
             reuse_matte: settings.reuse_matte,
             selfie_smoothing: settings.selfie_smoothing as f64,
+            background_color: settings.background_color.into(),
+            blur_radius: settings.blur_radius as f64,
             ..Default::default()
         },
     )?;
@@ -85,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let initial = sources.select(target.as_deref())?;
 
     let (effects, description) = Effects::load(
-        settings.effect,
+        settings.background(),
         settings.model,
         settings.reuse_matte,
         settings.selfie_smoothing,
@@ -137,6 +144,8 @@ fn snapshot(relay: &CameraRelay) -> dbus::Snapshot {
         effect: settings.effect,
         reuse_matte: settings.reuse_matte,
         selfie_smoothing: settings.selfie_smoothing as f64,
+        background_color: settings.background_color.into(),
+        blur_radius: settings.blur_radius as f64,
         stats: relay.stats(),
     }
 }
@@ -150,6 +159,8 @@ fn handle(relay: &CameraRelay, request: &dbus::Request) -> Result<(), String> {
             .map_err(|e| e.to_string()),
         Model(model) => relay.set_model(*model),
         Effect(effect) => relay.set_effect(*effect),
+        BackgroundColor(color) => relay.set_background_color(*color),
+        BlurRadius(radius) => relay.set_blur_radius(*radius),
         ReuseMatte(reuse) => {
             relay.set_reuse_matte(*reuse);
             Ok(())

@@ -38,7 +38,10 @@ pub struct Stats {
 /// Client side of the relay's D-Bus interface.
 ///
 /// `Model` and `Effect` are the names from [`ModelChoice::as_str`] and
-/// [`EffectChoice::as_str`]. `Camera` is the PipeWire node name of the camera
+/// [`EffectChoice::as_str`]. `BackgroundColor` is the `color` effect's
+/// sRGB colour; `BlurRadius` is the `blur` effect's Gaussian standard
+/// deviation as a percentage of the frame height, within
+/// [`BLUR_RADIUS_RANGE`]. `Camera` is the PipeWire node name of the camera
 /// being relayed, or empty for none; `Sources` lists (node name, has the
 /// Camera role) for every video source the daemon could use.
 #[zbus::proxy(
@@ -67,6 +70,16 @@ pub trait Relay {
     fn set_effect(&self, value: &str) -> zbus::Result<()>;
 
     #[zbus(property)]
+    fn background_color(&self) -> zbus::Result<(u8, u8, u8)>;
+    #[zbus(property)]
+    fn set_background_color(&self, value: (u8, u8, u8)) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn blur_radius(&self) -> zbus::Result<f64>;
+    #[zbus(property)]
+    fn set_blur_radius(&self, value: f64) -> zbus::Result<()>;
+
+    #[zbus(property)]
     fn reuse_matte(&self) -> zbus::Result<bool>;
     #[zbus(property)]
     fn set_reuse_matte(&self, value: bool) -> zbus::Result<()>;
@@ -80,7 +93,7 @@ pub trait Relay {
     fn stats(&self) -> zbus::Result<Stats>;
 }
 
-/// The matting model the green screen uses.
+/// The matting model the background effects use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModelChoice {
     /// RobustVideoMatting: best edges and temporal stability (GPL-3.0).
@@ -105,24 +118,43 @@ impl ModelChoice {
 /// What the relay does to each frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EffectChoice {
-    /// Replace the background with green using the matting model.
+    /// Pass the camera's picture through unchanged.
     #[default]
-    GreenScreen,
-    /// Flip upside down; a cheap stand-in that needs no model.
-    Flip,
+    None,
+    /// Blur the background, found with the matting model.
+    Blur,
+    /// Replace the background with a solid colour, found with the matting
+    /// model.
+    Color,
 }
 
 impl EffectChoice {
-    pub const ALL: [Self; 2] = [Self::GreenScreen, Self::Flip];
+    pub const ALL: [Self; 3] = [Self::None, Self::Blur, Self::Color];
 
     /// The name used in settings and environment variables.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::GreenScreen => "green",
-            Self::Flip => "flip",
+            Self::None => "none",
+            Self::Blur => "blur",
+            Self::Color => "color",
         }
     }
+
+    /// Whether the effect runs the matting model.
+    pub fn needs_matte(self) -> bool {
+        self != Self::None
+    }
 }
+
+/// Colour the `color` effect fills the background with, by default:
+/// chroma-key green.
+pub const DEFAULT_BACKGROUND_COLOR: (u8, u8, u8) = (0, 177, 64);
+
+/// How strongly the `blur` effect blurs, by default (see `BlurRadius`).
+pub const DEFAULT_BLUR_RADIUS: f64 = 2.0;
+
+/// The range of `BlurRadius` the daemon accepts.
+pub const BLUR_RADIUS_RANGE: std::ops::RangeInclusive<f64> = 0.25..=8.0;
 
 macro_rules! string_enum {
     ($ty:ty, $what:literal) => {
@@ -161,7 +193,8 @@ mod tests {
             assert_eq!(e.to_string().parse::<EffectChoice>(), Ok(e));
         }
         assert_eq!("rvm".parse(), Ok(ModelChoice::Rvm));
-        assert_eq!("green".parse(), Ok(EffectChoice::GreenScreen));
+        assert_eq!("blur".parse(), Ok(EffectChoice::Blur));
+        assert!(!EffectChoice::default().needs_matte());
         let err = "modnet".parse::<ModelChoice>().unwrap_err();
         assert!(err.contains("rvm, selfie"), "{err}");
     }
