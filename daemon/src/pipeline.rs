@@ -346,7 +346,7 @@ fn taps(n_in: usize, n_out: usize) -> Vec<(usize, usize, f32)> {
 }
 
 /// Resample `planes` planes of `w`x`h` in `src` to `dw`x`dh` in `dst`.
-fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usize, dh: usize, planes: usize) {
+pub(crate) fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usize, dh: usize, planes: usize) {
     let (xs, ys) = (taps(w, dw), taps(h, dh));
     let mut row = vec![0f32; w];
     for p in 0..planes {

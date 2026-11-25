@@ -3,10 +3,14 @@
 //! run through effects and packed as YUY2 by compute shaders
 //! (`pipeline.wgsl`), and the result is read back.
 //!
-//! Effects that use the matting model split the frame's GPU work in two:
-//! the GPU downsamples the frame to the model's input, which is read back
-//! and run on the model (NPU), and the model's small output is uploaded for
-//! the second half. The full-resolution frame stays on the GPU throughout.
+//! Effects that use the matting model split the frame's GPU work into
+//! stages around the model (NPU): [`ingest`](GpuProcessor::ingest) makes
+//! the model's small input straight from the camera's bytes and reads it
+//! back, while the full-resolution unpack follows on the GPU;
+//! [`blur`](GpuProcessor::blur) runs while the model works; and
+//! [`finish`](GpuProcessor::finish) uploads the model's output, composites
+//! and packs. The full-resolution frame stays on the GPU throughout, in one
+//! of a few slots, so stages of different frames can overlap.
 
 use std::{
     error::Error,
@@ -102,7 +106,8 @@ pub struct GpuProcessor {
     layout: wgpu::BindGroupLayout,
     unpack_packed: wgpu::ComputePipeline,
     unpack_yuy2: wgpu::ComputePipeline,
-    downsample: wgpu::ComputePipeline,
+    downsample_packed: wgpu::ComputePipeline,
+    downsample_yuy2: wgpu::ComputePipeline,
     unpack_coef: wgpu::ComputePipeline,
     composite_color: wgpu::ComputePipeline,
     blur_down: wgpu::ComputePipeline,
@@ -110,7 +115,8 @@ pub struct GpuProcessor {
     blur_v: wgpu::ComputePipeline,
     composite_blur: wgpu::ComputePipeline,
     pack_yuy2: wgpu::ComputePipeline,
-    /// The frame at model resolution (f16), written by `downsample`.
+    /// The frame at model resolution (f16): the model's input, made from the
+    /// camera's bytes by `downsample_packed` / `downsample_yuy2`.
     small: wgpu::Buffer,
     small_readback: wgpu::Buffer,
     /// The model's output (f16 A then b), read by the composite passes.
@@ -244,7 +250,8 @@ impl GpuProcessor {
             profiler,
             unpack_packed: pipeline("unpack_packed"),
             unpack_yuy2: pipeline("unpack_yuy2"),
-            downsample: pipeline("downsample"),
+            downsample_packed: pipeline("downsample_packed"),
+            downsample_yuy2: pipeline("downsample_yuy2"),
             unpack_coef: pipeline("unpack_coef"),
             composite_color: pipeline("composite_color"),
             blur_down: pipeline("blur_down"),
@@ -420,24 +427,35 @@ impl GpuProcessor {
         self.times.upload += t0.elapsed();
         self.mark("uploaded");
 
+        // The model's input first, straight from the camera's bytes, and its
+        // readback; then the full-resolution unpack, which runs while the
+        // model input is read back and the model works.
+        let model_input = background.map(|_| {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            let (mw, mh) = self.model_size;
+            let (downsample, name) = match input {
+                InputFormat::Packed { .. } => (&self.downsample_packed, "downsample_packed"),
+                InputFormat::Yuy2 => (&self.downsample_yuy2, "downsample_yuy2"),
+            };
+            self.dispatch(&mut encoder, slot, downsample, name, (mw / 2) as u32, mh as u32);
+            let bytes = self.small.size();
+            encoder.copy_buffer_to_buffer(&self.small, 0, &self.small_readback, 0, bytes);
+            let index = self.queue.submit([encoder.finish()]);
+            self.submitted("model input");
+            (index, bytes)
+        });
+        let t = Instant::now();
         let (w, h) = (width as u32, height as u32);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         match input {
             InputFormat::Packed { .. } => self.dispatch(&mut encoder, slot, &self.unpack_packed, "unpack_packed", w, h),
             InputFormat::Yuy2 => self.dispatch(&mut encoder, slot, &self.unpack_yuy2, "unpack_yuy2", w / 2, h),
         }
-        if background.is_none() {
-            self.queue.submit([encoder.finish()]);
-            self.submitted("unpack");
+        self.queue.submit([encoder.finish()]);
+        self.submitted("unpack");
+        let Some((index, bytes)) = model_input else {
             return Ok(false);
-        }
-        let (mw, mh) = self.model_size;
-        self.dispatch(&mut encoder, slot, &self.downsample, "downsample", (mw / 2) as u32, mh as u32);
-        let bytes = self.small.size();
-        encoder.copy_buffer_to_buffer(&self.small, 0, &self.small_readback, 0, bytes);
-        let t = Instant::now();
-        let index = self.queue.submit([encoder.finish()]);
-        self.submitted("model input");
+        };
         self.wait_mapped(&self.small_readback, bytes, index)?;
         self.times.gpu += t.elapsed();
         self.mark("model input waited");
@@ -732,4 +750,68 @@ fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> [wgpu::Buffer
         buffer("coef4", (8 * w * h * 4) as u64, U::STORAGE),
         buffer("coef alpha", (2 * w * h * 4) as u64, U::STORAGE | U::COPY_DST),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use half::slice::HalfFloatSliceExt;
+    use pipewire::spa::param::video::VideoFormat;
+
+    use super::*;
+    use crate::{
+        model::fake::FakeMatte,
+        pipeline::{PlanarFrame, resample, unpack},
+    };
+
+    /// The model input the GPU makes from the camera's bytes matches the
+    /// CPU's (unpack, then resample) to within one f16 step.
+    #[test]
+    fn model_input_from_camera_bytes_matches_cpu() {
+        let mut gpu = match GpuProcessor::new() {
+            Ok(gpu) => gpu,
+            Err(e) => return eprintln!("skipping: no GPU ({e})"),
+        };
+        let formats = [
+            ("BGRx", InputFormat::from_video_format(VideoFormat::BGRx).unwrap()),
+            ("RGBx", InputFormat::from_video_format(VideoFormat::RGBx).unwrap()),
+            ("YUY2", InputFormat::Yuy2),
+        ];
+        for (mw, mh) in [(480, 270), (256, 144)] {
+            let matting = Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false);
+            gpu.set_effects(vec![GpuEffect::ReplaceBackground(matting, Background::Color([0.0; 3]))]);
+            for (w, h) in [(200, 120), (70, 37), (640, 360)] {
+                for (name, format) in formats {
+                    let stride = format.row_bytes(w) + 8;
+                    let src: Vec<u8> = (0..stride * h)
+                        .map(|i| {
+                            let v = (i * 7 + (i / stride) * 13) % 256;
+                            // Keep YUY2 chroma near neutral so colours stay in gamut.
+                            match format {
+                                InputFormat::Yuy2 if i % 2 == 1 => 108 + (v % 40) as u8,
+                                _ => v as u8,
+                            }
+                        })
+                        .collect();
+                    let bg = Some(Background::Color([0.0; 3]));
+                    assert!(gpu.ingest(0, format, &src, stride, w, h, bg).unwrap());
+                    let got = gpu.model_input().to_vec();
+                    let mut dst = vec![0u8; w * 2 * h];
+                    let (a, b) = (vec![f16::ZERO; 4 * mw * mh], vec![f16::ZERO; 4 * mw * mh]);
+                    gpu.finish(0, Some((&a, &b)), &mut dst, w * 2).unwrap();
+
+                    let mut frame = PlanarFrame::default();
+                    frame.resize(w, h);
+                    assert!(unpack(format, &src, stride, &mut frame));
+                    let planes: Vec<f32> = frame.planes().concat();
+                    let mut small = vec![0.0; 3 * mw * mh];
+                    resample(&planes, w, h, &mut small, mw, mh, 3);
+                    let mut want = vec![f16::ZERO; small.len()];
+                    want.convert_from_f32_slice(&small);
+
+                    let worst = got.iter().zip(&want).map(|(g, w)| g.to_bits().abs_diff(w.to_bits())).max().unwrap();
+                    assert!(worst <= 1, "{name} {w}x{h} -> {mw}x{mh}: off by {worst} f16 steps");
+                }
+            }
+        }
+    }
 }

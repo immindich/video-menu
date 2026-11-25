@@ -152,34 +152,72 @@ fn tap(i: u32, n_in: u32, n_out: u32) -> Tap {
     return Tap(i0, min(i0 + 1u, n_in - 1u), x - f32(i0));
 }
 
-fn planar_at(c: u32, x: u32, y: u32) -> f32 {
-    return planar[c * p.width * p.height + y * p.width + x];
+// The camera's pixel (x, y) as RGB, unpacked exactly as unpack_packed and
+// unpack_yuy2 do.
+fn src_packed(x: u32, y: u32) -> vec3<f32> {
+    let word = src[y * p.src_words + x];
+    return vec3<f32>(byte_at(word, p.r_shift), byte_at(word, p.g_shift), byte_at(word, p.b_shift)) * (1.0 / 255.0);
 }
 
-// Bilinear sample of full-resolution plane c (vertical, then horizontal,
-// like resample() in pipeline.rs).
-fn sample_planar(c: u32, tx: Tap, ty: Tap) -> f32 {
-    let left = planar_at(c, tx.i0, ty.i0) * (1.0 - ty.w) + planar_at(c, tx.i0, ty.i1) * ty.w;
-    let right = planar_at(c, tx.i1, ty.i0) * (1.0 - ty.w) + planar_at(c, tx.i1, ty.i1) * ty.w;
+fn src_yuy2(x: u32, y: u32) -> vec3<f32> {
+    let word = src[y * p.src_words + x / 2u];
+    let cb = (byte_at(word, 8u) - 128.0) * (1.0 / 224.0);
+    let cr = (byte_at(word, 24u) - 128.0) * (1.0 / 224.0);
+    let d = vec3<f32>(1.402 * cr, -0.344136 * cb - 0.714136 * cr, 1.772 * cb);
+    let luma = (byte_at(word, (x % 2u) * 16u) - 16.0) * (1.0 / 219.0);
+    return clamp(vec3<f32>(luma) + d, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Bilinear sample of the camera frame (vertical, then horizontal, like
+// resample() in pipeline.rs; per channel the arithmetic is the same as
+// unpacking first and sampling the planes).
+fn sample_src(yuy2: bool, tx: Tap, ty: Tap) -> vec3<f32> {
+    var c00: vec3<f32>;
+    var c01: vec3<f32>;
+    var c10: vec3<f32>;
+    var c11: vec3<f32>;
+    if (yuy2) {
+        c00 = src_yuy2(tx.i0, ty.i0);
+        c01 = src_yuy2(tx.i0, ty.i1);
+        c10 = src_yuy2(tx.i1, ty.i0);
+        c11 = src_yuy2(tx.i1, ty.i1);
+    } else {
+        c00 = src_packed(tx.i0, ty.i0);
+        c01 = src_packed(tx.i0, ty.i1);
+        c10 = src_packed(tx.i1, ty.i0);
+        c11 = src_packed(tx.i1, ty.i1);
+    }
+    let left = c00 * (1.0 - ty.w) + c01 * ty.w;
+    let right = c10 * (1.0 - ty.w) + c11 * ty.w;
     return left * (1.0 - tx.w) + right * tx.w;
 }
 
-// One invocation per horizontal pair of model-resolution pixels.
-@compute @workgroup_size(16, 16)
-fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
+// The model's input straight from the camera's bytes, so the model can
+// start before the full-resolution frame is unpacked. One invocation per
+// horizontal pair of model-resolution pixels.
+fn downsample_src(id: vec3<u32>, yuy2: bool) {
     if (id.x * 2u >= p.small_w || id.y >= p.small_h) {
         return;
     }
     let x = id.x * 2u;
     let ty = tap(id.y, p.height, p.small_h);
-    let t0 = tap(x, p.width, p.small_w);
-    let t1 = tap(x + 1u, p.width, p.small_w);
+    let a = sample_src(yuy2, tap(x, p.width, p.small_w), ty);
+    let b = sample_src(yuy2, tap(x + 1u, p.width, p.small_w), ty);
     let plane_words = p.small_w * p.small_h / 2u;
     let word = (id.y * p.small_w + x) / 2u;
     for (var c = 0u; c < 3u; c++) {
-        let v = vec2<f32>(sample_planar(c, t0, ty), sample_planar(c, t1, ty));
-        small[c * plane_words + word] = pack2x16float(v);
+        small[c * plane_words + word] = pack2x16float(vec2<f32>(a[c], b[c]));
     }
+}
+
+@compute @workgroup_size(16, 16)
+fn downsample_packed(@builtin(global_invocation_id) id: vec3<u32>) {
+    downsample_src(id, false);
+}
+
+@compute @workgroup_size(16, 16)
+fn downsample_yuy2(@builtin(global_invocation_id) id: vec3<u32>) {
+    downsample_src(id, true);
 }
 
 fn coef_at(k: u32, i: u32) -> f32 {
