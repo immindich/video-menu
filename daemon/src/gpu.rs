@@ -19,6 +19,7 @@ use half::f16;
 
 use crate::{
     model::Matting,
+    profile::GpuProfiler,
     pipeline::{self, Background, BlurGeometry, InputFormat, MAX_BLUR_TAPS},
 };
 
@@ -109,6 +110,8 @@ pub struct GpuProcessor {
     /// Resolution of the matting model, which sizes `small` and `coef`.
     model_size: (usize, usize),
     adapter_name: String,
+    /// Records a timeline of each frame, if `VIDEO_MENU_GPU_PROFILE` is set.
+    profiler: Option<GpuProfiler>,
 }
 
 /// Where the time for one frame went.
@@ -138,6 +141,12 @@ impl GpuProcessor {
             // Planar f32 frames are large (24 MB at 1080p); allow what the
             // hardware allows rather than wgpu's conservative defaults.
             required_limits: adapter.limits(),
+            // Only for profiling, which needs timestamps.
+            required_features: if std::env::var_os("VIDEO_MENU_GPU_PROFILE").is_some() {
+                adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
             ..Default::default()
         }))?;
 
@@ -207,7 +216,9 @@ impl GpuProcessor {
         let model_size = (2, 1);
         let [small, small_readback, coef, coef4, coef_alpha] = model_buffers(&device, model_size);
 
+        let profiler = GpuProfiler::from_env(&device, &queue);
         Ok(Self {
+            profiler,
             unpack_packed: pipeline("unpack_packed"),
             unpack_yuy2: pipeline("unpack_yuy2"),
             downsample: pipeline("downsample"),
@@ -321,6 +332,9 @@ impl GpuProcessor {
             _ => None,
         };
         self.ensure_frame(width, height, blur.map_or(0, |g| g.len()));
+        if let Some(p) = &self.profiler {
+            p.begin(format!("{width}x{height} {background:?}"));
+        }
 
         // Upload, dropping any row padding so the shader can index rows tightly.
         let row_bytes = input.row_bytes(width);
@@ -366,6 +380,7 @@ impl GpuProcessor {
         }
         self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let mut times = Times { upload: t0.elapsed(), gpu: Duration::ZERO, model: Duration::ZERO };
+        self.mark("uploaded");
 
         let (w, h) = (width as u32, height as u32);
         let pairs = w / 2;
@@ -374,8 +389,8 @@ impl GpuProcessor {
             encoder.clear_buffer(&self.coef_alpha, 0, None);
         }
         match input {
-            InputFormat::Packed { .. } => self.dispatch(&mut encoder, &self.unpack_packed, w, h),
-            InputFormat::Yuy2 => self.dispatch(&mut encoder, &self.unpack_yuy2, pairs, h),
+            InputFormat::Packed { .. } => self.dispatch(&mut encoder, &self.unpack_packed, "unpack_packed", w, h),
+            InputFormat::Yuy2 => self.dispatch(&mut encoder, &self.unpack_yuy2, "unpack_yuy2", pairs, h),
         }
         // Take the effects out so they can be borrowed alongside `self`.
         let mut effects = std::mem::take(&mut self.effects);
@@ -394,26 +409,31 @@ impl GpuProcessor {
                         break;
                     }
                     let (mw, mh) = self.model_size;
-                    self.dispatch(&mut encoder, &self.unpack_coef, mw as u32, mh as u32);
-                    let composite = match background {
-                        Background::Color(_) => &self.composite_color,
-                        Background::Blur { .. } => &self.composite_blur,
+                    self.dispatch(&mut encoder, &self.unpack_coef, "unpack_coef", mw as u32, mh as u32);
+                    let (composite, name) = match background {
+                        Background::Color(_) => (&self.composite_color, "composite_color"),
+                        Background::Blur { .. } => (&self.composite_blur, "composite_blur"),
                     };
-                    self.dispatch(&mut encoder, composite, w, h);
+                    self.dispatch(&mut encoder, composite, name, w, h);
                 }
             }
         }
         self.effects = effects;
         result?;
-        self.dispatch(&mut encoder, &self.pack_yuy2, pairs, h);
+        self.dispatch(&mut encoder, &self.pack_yuy2, "pack_yuy2", pairs, h);
 
         let frame = self.frame.as_ref().unwrap();
         let out_bytes = (width * 2 * height) as u64;
         encoder.copy_buffer_to_buffer(&frame.output, 0, &frame.readback, 0, out_bytes);
+        if let Some(p) = &self.profiler {
+            p.resolve(&mut encoder);
+        }
         let t1 = Instant::now();
         self.queue.submit([encoder.finish()]);
+        self.submitted("output");
         self.wait_mapped(&frame.readback, out_bytes)?;
         times.gpu += t1.elapsed();
+        self.mark("output waited");
 
         let t2 = Instant::now();
         {
@@ -428,7 +448,24 @@ impl GpuProcessor {
             }
         }
         frame.readback.unmap();
-        Ok([times.upload, times.gpu, times.model, t2.elapsed()])
+        let times = [times.upload, times.gpu, times.model, t2.elapsed()];
+        if let Some(p) = &self.profiler {
+            p.mark("output copied");
+            p.finish(&self.device);
+        }
+        Ok(times)
+    }
+
+    fn mark(&self, name: &'static str) {
+        if let Some(p) = &self.profiler {
+            p.mark(name);
+        }
+    }
+
+    fn submitted(&self, name: &'static str) {
+        if let Some(p) = &self.profiler {
+            p.submitted(name);
+        }
     }
 
     /// Finish the GPU work recorded in `encoder` with a downsample to the
@@ -444,15 +481,17 @@ impl GpuProcessor {
         blur: Option<BlurGeometry>,
     ) -> Result<(), String> {
         let (mw, mh) = self.model_size;
-        self.dispatch(encoder, &self.downsample, (mw / 2) as u32, mh as u32);
+        self.dispatch(encoder, &self.downsample, "downsample", (mw / 2) as u32, mh as u32);
         let bytes = self.small.size();
         encoder.copy_buffer_to_buffer(&self.small, 0, &self.small_readback, 0, bytes);
         let fresh = self.device.create_command_encoder(&Default::default());
         let finished = std::mem::replace(encoder, fresh).finish();
         let t = Instant::now();
         self.queue.submit([finished]);
+        self.submitted("model input");
         self.wait_mapped(&self.small_readback, bytes)?;
         times.gpu += t.elapsed();
+        self.mark("model input waited");
         {
             let mapped = self
                 .small_readback
@@ -466,12 +505,15 @@ impl GpuProcessor {
         if let Some(g) = blur {
             let mut blur_encoder = self.device.create_command_encoder(&Default::default());
             let (bw, bh) = (g.width as u32, g.height as u32);
-            self.dispatch(&mut blur_encoder, &self.blur_down, bw, bh);
-            self.dispatch(&mut blur_encoder, &self.blur_h, bw, bh);
-            self.dispatch(&mut blur_encoder, &self.blur_v, bw, bh);
+            self.dispatch(&mut blur_encoder, &self.blur_down, "blur_down", bw, bh);
+            self.dispatch(&mut blur_encoder, &self.blur_h, "blur_h", bw, bh);
+            self.dispatch(&mut blur_encoder, &self.blur_v, "blur_v", bw, bh);
             self.queue.submit([blur_encoder.finish()]);
+            self.submitted("blur");
         }
+        self.mark("model start");
         let (a, b) = matte.run(&self.small_host)?;
+        self.mark("model done");
         let t = Instant::now();
         self.queue.write_buffer(&self.coef, 0, bytemuck::cast_slice(a));
         self.queue.write_buffer(&self.coef, (a.len() * 2) as u64, bytemuck::cast_slice(b));
@@ -480,9 +522,18 @@ impl GpuProcessor {
         Ok(())
     }
 
-    /// Record `pipeline` over a `x`x`y` grid of invocations.
-    fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline, x: u32, y: u32) {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
+    /// Record `pipeline` (called `name`, for profiling) over a `x`x`y` grid
+    /// of invocations.
+    fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        name: &'static str,
+        x: u32,
+        y: u32,
+    ) {
+        let timestamp_writes = self.profiler.as_ref().and_then(|p| p.pass(name));
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes });
         pass.set_bind_group(0, &self.frame.as_ref().unwrap().bind_group, &[]);
         pass.set_pipeline(pipeline);
         pass.dispatch_workgroups(x.div_ceil(WORKGROUP), y.div_ceil(WORKGROUP), 1);

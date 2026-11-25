@@ -38,6 +38,8 @@
 //! - `VIDEO_MENU_MODEL_DEVICE` is the device the model runs on (default NPU).
 //! - `VIDEO_MENU_NPU_TURBO=1` trades CPU time for slightly lower model
 //!   latency when the camera is slow (see `model.rs`).
+//! - `VIDEO_MENU_GPU_PROFILE=FILE` records a timeline of each frame's GPU
+//!   work to `FILE` (see `profile.rs`).
 //! - `VIDEO_MENU_REUSE_MATTE=1` composites each frame with the previous
 //!   frame's matte while the model works on the current one, taking the
 //!   model off the path from camera to output. The matte then lags the
@@ -49,6 +51,7 @@ mod gpu;
 mod model;
 mod pipeline;
 mod processor;
+mod profile;
 mod relay;
 
 use std::{error::Error, rc::Rc};
