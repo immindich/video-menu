@@ -97,8 +97,15 @@ pub struct Matting {
     /// Composite each frame with the previous frame's result, so the model
     /// runs alongside the rest of the pipeline instead of before it.
     reuse: bool,
-    /// A frame is in flight (reuse mode only).
+    /// A frame is in flight whose result the next frame will use (reuse
+    /// mode only).
     pending: bool,
+    /// [`begin`](Self::begin) started this frame's own result, which
+    /// [`end`](Self::end) waits for.
+    started: bool,
+    /// In reuse mode, the first frame's input, which the model is started on
+    /// again once it has that frame's own result.
+    first: Vec<f16>,
     /// The matte has a result to reuse.
     ready: bool,
     last: Duration,
@@ -106,7 +113,7 @@ pub struct Matting {
 
 impl Matting {
     pub fn new(matte: Box<dyn Matte>, reuse: bool) -> Self {
-        Self { matte, reuse, pending: false, ready: false, last: Duration::ZERO }
+        Self { matte, reuse, pending: false, started: false, first: Vec::new(), ready: false, last: Duration::ZERO }
     }
 
     /// The resolution the model works at.
@@ -121,9 +128,7 @@ impl Matting {
         if reuse == self.reuse {
             return;
         }
-        if std::mem::take(&mut self.pending) {
-            let _ = self.matte.finish();
-        }
+        self.settle();
         self.ready = false;
         self.reuse = reuse;
     }
@@ -138,30 +143,64 @@ impl Matting {
     /// model then starts on `src` in the background). The first frame after
     /// a reset always waits for its own result.
     pub fn run(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String> {
+        self.begin(src)?;
+        self.end()
+    }
+
+    /// The first half of [`run`](Self::run): start the model on `src`, so
+    /// the caller can do other work while it runs, then call
+    /// [`end`](Self::end) for the coefficients.
+    pub fn begin(&mut self, src: &[f16]) -> Result<(), String> {
         let start = Instant::now();
-        if self.pending {
-            self.pending = false;
-            self.matte.finish()?;
-        } else if !self.reuse || !self.ready {
-            self.matte.start(src)?;
-            self.matte.finish()?;
-        }
-        if self.reuse {
-            // The first frame was just run synchronously; running it again
-            // here only gives the recurrent state one more look at it.
+        if self.reuse && self.ready {
+            // Composite with the result in flight; start on this frame.
+            if std::mem::take(&mut self.pending) {
+                self.matte.finish()?;
+            }
             self.matte.start(src)?;
             self.pending = true;
+        } else {
+            self.matte.start(src)?;
+            self.started = true;
+            if self.reuse {
+                self.first.clear();
+                self.first.extend_from_slice(src);
+            }
+        }
+        self.last = start.elapsed();
+        Ok(())
+    }
+
+    /// Wait for the frame [`begin`](Self::begin) started, if this frame
+    /// needs its own result, and return the coefficients to composite with.
+    pub fn end(&mut self) -> Result<(&[f16], &[f16]), String> {
+        let start = Instant::now();
+        if std::mem::take(&mut self.started) {
+            self.matte.finish()?;
+            if self.reuse {
+                // The first frame after a reset waited for its own result;
+                // keep the model busy with it, so the next frame has one
+                // in flight to reuse (the recurrent state gets one more look
+                // at this frame).
+                self.matte.start(&self.first)?;
+                self.pending = true;
+            }
         }
         self.ready = true;
-        self.last = start.elapsed();
+        self.last += start.elapsed();
         Ok(self.matte.coefficients())
+    }
+
+    /// Wait for any frame in flight, so the model is idle.
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.pending) | std::mem::take(&mut self.started) {
+            let _ = self.matte.finish();
+        }
     }
 
     /// Forget temporal state, e.g. after switching cameras or frame sizes.
     pub fn reset(&mut self) {
-        if std::mem::take(&mut self.pending) {
-            let _ = self.matte.finish();
-        }
+        self.settle();
         self.matte.reset();
         self.ready = false;
     }
@@ -175,9 +214,7 @@ impl Matting {
 impl Drop for Matting {
     fn drop(&mut self) {
         // Don't free the model's buffers while it may still be using them.
-        if self.pending {
-            let _ = self.matte.finish();
-        }
+        self.settle();
     }
 }
 
