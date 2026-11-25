@@ -1,12 +1,9 @@
 //! Frame processing: camera pixels are unpacked into planar RGB, effects run
 //! on that, and the result is packed as YUY2 for the virtual camera.
 
-use std::time::Duration;
-
 use half::{f16, slice::HalfFloatSliceExt};
 use pipewire::spa::param::video::VideoFormat;
 
-use crate::model::Matting;
 
 /// A frame as three planes (R, G, B) of `f32` samples in `0..=1`.
 #[derive(Default)]
@@ -172,42 +169,7 @@ pub fn pack_yuy2_bt601(frame: &PlanarFrame, dst: &mut [u8], stride: usize) {
     }
 }
 
-/// An in-place transformation of a frame.
-pub trait Effect {
-    #[cfg(test)]
-    fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
-        self.apply_with_input(frame, None)
-    }
-
-    /// [`apply`](Self::apply), with the model's input already made (e.g.
-    /// by a scaled JPEG decode) for effects that run a model.
-    fn apply_with_input(&mut self, frame: &mut PlanarFrame, model_input: Option<&[f16]>) -> Result<(), String>;
-
-    /// The resolution of the model this effect runs, if any.
-    fn model_size(&self) -> Option<(usize, usize)> {
-        None
-    }
-
-    /// Time the last [`apply`](Self::apply) spent waiting for a model.
-    fn model_time(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    /// Forget any temporal state, e.g. after switching cameras.
-    fn reset(&mut self) {}
-
-    /// The matting model this effect runs, if any, so its settings can be
-    /// changed in place.
-    fn matting_mut(&mut self) -> Option<&mut Matting> {
-        None
-    }
-
-    /// Change what goes behind the person, for effects that replace the
-    /// background.
-    fn set_background(&mut self, _background: Background) {}
-}
-
-/// What [`ReplaceBackground`] puts behind the person.
+/// What a background effect puts behind the person.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Background {
     /// A solid colour, as 0..1 RGB like the frame's samples.
@@ -375,68 +337,155 @@ pub(crate) fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usi
     }
 }
 
-/// Replaces the background with a colour or a blur of itself, using the
-/// matting model to find the person.
+/// How many frames the CPU backend can hold at once (as the GPU's slots).
+pub const SLOTS: usize = 3;
+
+/// A frame held by the [`CpuProcessor`] between stages.
+#[derive(Default)]
+struct CpuSlot {
+    frame: PlanarFrame,
+    /// Its blurred background: four planes at full resolution, weighted
+    /// colour and then the weight.
+    blurred: Vec<f32>,
+    job: Option<CpuJob>,
+}
+
+#[derive(Clone, Copy)]
+struct CpuJob {
+    background: Option<Background>,
+    blurred: bool,
+}
+
+/// The CPU backend, and the reference the GPU's shaders follow. Each frame
+/// goes through three stages, in a slot of its own so frames can overlap:
+/// [`ingest`](Self::ingest) unpacks it to planar RGB and makes the model's
+/// input; [`blur`](Self::blur) blurs its background, if the effect is a
+/// blur; [`finish`](Self::finish) composites it with the model's result and
+/// packs it as YUY2.
 ///
-/// The frame is downsampled to the model's resolution, the model returns
-/// coefficients `A` and `b` there, and these are upsampled to the frame's
+/// The model sees the frame downsampled to its resolution and returns
+/// coefficients `A` and `b` there; these are upsampled to the frame's
 /// resolution, where `A * [R, G, B, gray] + b` gives the foreground colour
 /// (as a residual on the frame) and alpha. This is RVM's own refiner step.
 ///
 /// For a blur, the background is the frame scaled down, blurred with each
 /// pixel weighted by how much it is background (so the person doesn't bleed
 /// into it as a halo), and sampled back up. The weights come from the
-/// previous frame's matte, so that on the GPU the blur can run while the
-/// model works on this one; only moving edges see the difference, for a
-/// frame.
-pub struct ReplaceBackground {
-    matte: Matting,
-    background: Background,
-    /// Size of the last frame; the model's temporal state is reset when it
-    /// changes.
-    size: (usize, usize),
+/// alpha of the last frame finished before the blur, so that the blur can
+/// run while the model works on this one; only moving edges see the
+/// difference, for a frame.
+pub struct CpuProcessor {
+    slots: Vec<CpuSlot>,
+    model_size: (usize, usize),
     small: Vec<f32>,
     small16: Vec<f16>,
     coef: Vec<f32>,
     coef_full: Vec<f32>,
-    /// The previous frame's alpha coefficients (A, then b) at the model's
-    /// resolution, for the blur's weights; zero (no person) at first.
+    /// The alpha coefficients (A, then b) at the model's resolution of the
+    /// last finished frame, for the blur's weights; zero (no person) after
+    /// a reset.
     prev_alpha_coef: Vec<f32>,
-    /// Blur scratch: those coefficients and alpha at full resolution, the
-    /// two scaled-down buffers the blur passes between, and the result back
-    /// at full resolution.
+    /// Blur scratch: those coefficients and alpha at full resolution, and
+    /// the two scaled-down buffers the blur passes between.
     alpha_coef: Vec<f32>,
     alpha: Vec<f32>,
     blur: [Vec<f32>; 2],
-    blurred: Vec<f32>,
 }
 
-impl ReplaceBackground {
-    pub fn new(matte: Matting, background: Background) -> Self {
-        let (mw, mh) = matte.size();
-        Self {
-            matte,
-            background,
-            size: (0, 0),
-            small: vec![0.0; 3 * mw * mh],
-            small16: vec![f16::ZERO; 3 * mw * mh],
-            coef: vec![0.0; 8 * mw * mh],
+impl Default for CpuProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CpuProcessor {
+    pub fn new() -> Self {
+        let mut cpu = Self {
+            slots: (0..SLOTS).map(|_| CpuSlot::default()).collect(),
+            model_size: (0, 0),
+            small: Vec::new(),
+            small16: Vec::new(),
+            coef: Vec::new(),
             coef_full: Vec::new(),
-            prev_alpha_coef: vec![0.0; 2 * mw * mh],
+            prev_alpha_coef: Vec::new(),
             alpha_coef: Vec::new(),
             alpha: Vec::new(),
             blur: Default::default(),
-            blurred: Vec::new(),
-        }
+        };
+        cpu.set_model_size((2, 1));
+        cpu
     }
 
-    /// Blur the background of `frame` into `self.blurred`: four planes at
-    /// full resolution, weighted colour and then the weight. Uses the
-    /// previous frame's matte.
-    fn blur_background(&mut self, frame: &PlanarFrame, radius: f32) {
+    /// Size the model's buffers for a model working at `(w, h)`, and forget
+    /// the last frame's alpha.
+    pub fn set_model_size(&mut self, (mw, mh): (usize, usize)) {
+        self.model_size = (mw, mh);
+        self.small = vec![0.0; 3 * mw * mh];
+        self.small16 = vec![f16::ZERO; 3 * mw * mh];
+        self.coef = vec![0.0; 8 * mw * mh];
+        self.prev_alpha_coef = vec![0.0; 2 * mw * mh];
+    }
+
+    /// Forget the last frame's alpha, e.g. after switching cameras.
+    pub fn reset_alpha(&mut self) {
+        self.prev_alpha_coef.fill(0.0);
+    }
+
+    /// Unpack a camera frame into `slot`. With a `background` (an effect
+    /// that runs the model), also make the model's input (unless
+    /// `model_input` gives it), leave it in
+    /// [`model_input`](Self::model_input), and return true.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest(
+        &mut self,
+        slot: usize,
+        input: InputFormat,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        background: Option<Background>,
+        model_input: Option<&[f16]>,
+    ) -> Result<bool, String> {
+        let s = &mut self.slots[slot];
+        s.frame.resize(width, height);
+        if !unpack(input, src, src_stride, &mut s.frame) {
+            return Err(format!("short frame ({} bytes)", src.len()));
+        }
+        s.job = Some(CpuJob { background, blurred: false });
+        if background.is_none() {
+            return Ok(false);
+        }
+        match model_input {
+            Some(given) if given.len() == self.small16.len() => self.small16.copy_from_slice(given),
+            Some(given) => {
+                return Err(format!("model input has {} values, expected {}", given.len(), self.small16.len()));
+            }
+            None => {
+                let (mw, mh) = self.model_size;
+                resample(&s.frame.data, width, height, &mut self.small, mw, mh, 3);
+                self.small16.convert_from_f32_slice(&self.small);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The model input the last [`ingest`](Self::ingest) made.
+    pub fn model_input(&self) -> &[f16] {
+        &self.small16
+    }
+
+    /// Blur the background of the frame in `slot`, if its effect is a blur,
+    /// weighing pixels by the alpha of the last finished frame.
+    pub fn blur(&mut self, slot: usize) {
+        let Some(job) = self.slots[slot].job.as_mut() else { return };
+        let Some(Background::Blur { radius }) = job.background.filter(|_| !job.blurred) else { return };
+        job.blurred = true;
+        let s = &mut self.slots[slot];
+        let frame = &s.frame;
         let (w, h) = (frame.width(), frame.height());
         let pixels = w * h;
-        let (mw, mh) = self.matte.size();
+        let (mw, mh) = self.model_size;
         self.alpha_coef.resize(2 * pixels, 0.0);
         resample(&self.prev_alpha_coef, mw, mh, &mut self.alpha_coef, w, h, 2);
         let (ca, cb) = self.alpha_coef.split_at(pixels);
@@ -454,59 +503,59 @@ impl ReplaceBackground {
         blur_down(frame.planes(), &self.alpha, w, h, &g, a);
         blur_pass(a, b, &g, &kernel, true);
         blur_pass(b, a, &g, &kernel, false);
-        self.blurred.resize(4 * pixels, 0.0);
-        resample(a, g.width, g.height, &mut self.blurred, w, h, 4);
-    }
-}
-
-impl Effect for ReplaceBackground {
-    fn model_size(&self) -> Option<(usize, usize)> {
-        Some(self.matte.size())
+        s.blurred.resize(4 * pixels, 0.0);
+        resample(a, g.width, g.height, &mut s.blurred, w, h, 4);
     }
 
-    fn apply_with_input(&mut self, frame: &mut PlanarFrame, model_input: Option<&[f16]>) -> Result<(), String> {
-        let (w, h) = (frame.width(), frame.height());
-        if self.size != (w, h) {
-            self.reset();
-            self.size = (w, h);
+    /// Composite the frame in `slot` with the model's coefficients (for an
+    /// effect that runs the model), pack it as YUY2 into `dst` (rows
+    /// `dst_stride` apart), and free the slot.
+    pub fn finish(
+        &mut self,
+        slot: usize,
+        coefficients: Option<(&[f16], &[f16])>,
+        dst: &mut [u8],
+        dst_stride: usize,
+    ) -> Result<(), String> {
+        let job = self.slots[slot].job.ok_or_else(|| format!("no frame in slot {slot}"))?;
+        if let Some(background) = job.background {
+            let (a, b) = coefficients.ok_or("the effect needs the model's coefficients")?;
+            self.blur(slot);
+            self.composite(slot, background, a, b)?;
         }
-        let blurred = match self.background {
-            Background::Blur { radius } => {
-                self.blur_background(frame, radius);
-                true
-            }
-            Background::Color(_) => false,
-        };
-        let (mw, mh) = self.matte.size();
-        match model_input {
-            Some(input) if input.len() == self.small16.len() => self.small16.copy_from_slice(input),
-            Some(input) => return Err(format!("model input has {} values, expected {}", input.len(), self.small16.len())),
-            None => {
-                resample(&frame.data, w, h, &mut self.small, mw, mh, 3);
-                self.small16.convert_from_f32_slice(&self.small);
-            }
-        }
-        let (a, b) = self.matte.run(&self.small16)?;
+        let s = &mut self.slots[slot];
+        s.job = None;
+        pack_yuy2_bt601(&s.frame, dst, dst_stride);
+        Ok(())
+    }
+
+    fn composite(&mut self, slot: usize, background: Background, a: &[f16], b: &[f16]) -> Result<(), String> {
+        let (mw, mh) = self.model_size;
         let n = 4 * mw * mh;
+        if a.len() != n || b.len() != n {
+            return Err(format!("the model gave {} and {} coefficients, expected {n}", a.len(), b.len()));
+        }
         a.convert_to_f32_slice(&mut self.coef[..n]);
         b.convert_to_f32_slice(&mut self.coef[n..]);
+        // These are now the last finished frame's, for later blurs.
         let m = mw * mh;
         self.prev_alpha_coef[..m].copy_from_slice(&self.coef[3 * m..4 * m]);
         self.prev_alpha_coef[m..].copy_from_slice(&self.coef[7 * m..8 * m]);
 
         // Upsample all 8 coefficient planes (A then b) to the frame size.
+        let s = &mut self.slots[slot];
+        let (w, h) = (s.frame.width(), s.frame.height());
         let pixels = w * h;
         self.coef_full.resize(8 * pixels, 0.0);
         resample(&self.coef, mw, mh, &mut self.coef_full, w, h, 8);
 
-        let color = match self.background {
+        let color = match background {
             Background::Color(color) => Some(color),
             Background::Blur { .. } => None,
         };
-        debug_assert_eq!(color.is_none(), blurred);
-        let [rp, gp, bp] = frame.planes_mut();
+        let [rp, gp, bp] = s.frame.planes_mut();
         let c = |k: usize| &self.coef_full[k * pixels..][..pixels];
-        let blurred = |k: usize| &self.blurred[k * pixels..][..pixels];
+        let blurred = |k: usize| &s.blurred[k * pixels..][..pixels];
         for i in 0..pixels {
             let x = [rp[i], gp[i], bp[i], (rp[i] + gp[i] + bp[i]) * (1.0 / 3.0)];
             let out = |k: usize| c(k)[i] * x[k] + c(4 + k)[i];
@@ -521,23 +570,6 @@ impl Effect for ReplaceBackground {
             bp[i] = fgr[2] * pha + bg[2] * (1.0 - pha);
         }
         Ok(())
-    }
-
-    fn model_time(&self) -> Duration {
-        self.matte.last_time()
-    }
-
-    fn reset(&mut self) {
-        self.matte.reset();
-        self.prev_alpha_coef.fill(0.0);
-    }
-
-    fn matting_mut(&mut self) -> Option<&mut Matting> {
-        Some(&mut self.matte)
-    }
-
-    fn set_background(&mut self, background: Background) {
-        self.background = background;
     }
 }
 
@@ -633,19 +665,26 @@ mod tests {
 
     #[test]
     fn colour_background_composites_by_alpha() {
-        use crate::model::fake::FakeMatte;
+        use crate::model::{Matte, fake::FakeMatte};
         let (w, h) = (64, 36);
-        let rows: Vec<[f32; 3]> = (0..w * h)
-            .map(|i| [(i % w) as f32 / w as f32, (i / w) as f32 / h as f32, 0.5])
-            .collect();
-        let mut frame = frame_from(w, h, &rows);
-        let matting = Matting::new(Box::<FakeMatte>::default(), false);
-        let mut effect = ReplaceBackground::new(matting, Background::Color(GREEN));
-        effect.apply(&mut frame).unwrap();
-        // Every output pixel lies between the (clamped) foreground and green.
-        for (k, plane) in frame.planes().iter().enumerate() {
-            assert!(plane.iter().all(|v| (0.0..=1.0).contains(v)), "channel {k} out of range");
+        let mut rgbx = Vec::with_capacity(w * h * 4);
+        for i in 0..w * h {
+            let (x, y) = (i % w, i / w);
+            rgbx.extend([(255 * x / w) as u8, (255 * y / h) as u8, 128, 0]);
         }
+        let format = InputFormat::from_video_format(VideoFormat::RGBx).unwrap();
+        let mut matte = FakeMatte::with_size(16, 9);
+        let mut cpu = CpuProcessor::new();
+        cpu.set_model_size(matte.size());
+        let bg = Some(Background::Color(GREEN));
+        assert!(cpu.ingest(0, format, &rgbx, w * 4, w, h, bg, None).unwrap());
+        matte.start(cpu.model_input()).unwrap();
+        matte.finish().unwrap();
+        let mut yuy2 = vec![0u8; w * 2 * h];
+        cpu.finish(0, Some(matte.coefficients()), &mut yuy2, w * 2).unwrap();
+        let mut frame = PlanarFrame::default();
+        frame.resize(w, h);
+        assert!(unpack(InputFormat::Yuy2, &yuy2, w * 2, &mut frame));
         // The fake model's alpha is 2R - B + ...: low on the left, high on
         // the right, so the left edge is green and the right is not.
         let [r, g, b] = frame.planes();
@@ -653,6 +692,13 @@ mod tests {
         assert!((left.0 - GREEN[0]).abs() < 0.05 && (left.1 - GREEN[1]).abs() < 0.05, "{left:?}");
         let right = w - 1;
         assert!((g[right] - GREEN[1]).abs() > 0.1, "right edge should keep its own colour");
+    }
+
+    #[test]
+    fn finish_without_a_frame_fails() {
+        let mut cpu = CpuProcessor::new();
+        let mut dst = [0u8; 8];
+        assert!(cpu.finish(1, None, &mut dst, 4).unwrap_err().contains("slot 1"));
     }
 
     #[test]

@@ -142,6 +142,7 @@ impl Matting {
     /// with: that frame's own, or in reuse mode the previous frame's (the
     /// model then starts on `src` in the background). The first frame after
     /// a reset always waits for its own result.
+    #[cfg(test)]
     pub fn run(&mut self, src: &[f16]) -> Result<(&[f16], &[f16]), String> {
         self.begin(src)?;
         self.end()

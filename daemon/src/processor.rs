@@ -1,21 +1,23 @@
 //! Turns camera frames into processed YUY2 frames. MJPG frames are decoded
 //! on the CPU (libjpeg-turbo); the rest of the pipeline runs on the GPU
 //! ([`crate::gpu`]) when one is available, otherwise on the CPU
-//! ([`crate::pipeline`]). Both backends produce the same output.
+//! ([`crate::pipeline`]). Both backends produce the same output, through
+//! the same stages: ingest, blur, finish, with the model between.
 //!
 //! Set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force a backend; `gpu` fails
 //! instead of falling back.
 
 use std::time::{Duration, Instant};
 
+use half::f16;
 use pipewire::spa::param::video::VideoFormat;
 
 use video_menu_protocol::ModelChoice;
 
 use crate::{
-    gpu::{GpuEffect, GpuProcessor},
+    gpu::GpuProcessor,
     model::{self, Matting},
-    pipeline::{self, Background, Effect, InputFormat, PlanarFrame, ReplaceBackground},
+    pipeline::{self, Background, CpuProcessor, InputFormat, PlanarFrame},
 };
 
 /// What to do to each frame.
@@ -49,20 +51,6 @@ impl Effects {
             format!("{what} with {description}{reuse_note}"),
         ))
     }
-
-    fn for_cpu(self) -> Vec<Box<dyn Effect>> {
-        match self {
-            Self::None => Vec::new(),
-            Self::Background(matte, bg) => vec![Box::new(ReplaceBackground::new(matte, bg))],
-        }
-    }
-
-    fn for_gpu(self) -> Vec<GpuEffect> {
-        match self {
-            Self::None => Vec::new(),
-            Self::Background(matte, bg) => vec![GpuEffect::ReplaceBackground(matte, bg)],
-        }
-    }
 }
 
 /// The encoding of an incoming camera frame.
@@ -72,51 +60,17 @@ pub enum FrameFormat {
     Mjpg,
 }
 
-struct CpuBackend {
-    planar: PlanarFrame,
-    effects: Vec<Box<dyn Effect>>,
-}
-
-enum Backend {
-    Cpu(CpuBackend),
+/// Where frames are processed. Both backends take the same stages; see
+/// [`CpuProcessor`] and [`GpuProcessor`].
+pub enum Backend {
+    Cpu(Box<CpuProcessor>),
     Gpu(Box<GpuProcessor>),
 }
 
-pub struct Processor {
-    backend: Backend,
-    /// JPEG decoder, created on the first MJPG frame.
-    jpeg: Option<turbojpeg::Decompressor>,
-    /// The last decoded MJPG frame, as RGBx.
-    decoded: Vec<u8>,
-    /// Makes the model's input from MJPG frames, before the full decode.
-    early: EarlyInput,
-}
-
-impl Processor {
-    fn with_backend(backend: Backend) -> Self {
-        Self { backend, jpeg: None, decoded: Vec::new(), early: EarlyInput::default() }
-    }
-
-    pub fn cpu(effects: Effects) -> Self {
-        Self::with_backend(Backend::Cpu(CpuBackend {
-            planar: PlanarFrame::default(),
-            effects: effects.for_cpu(),
-        }))
-    }
-
-    #[cfg(test)]
-    pub fn gpu(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self::on_gpu(GpuProcessor::new()?, effects))
-    }
-
-    fn on_gpu(mut gpu: GpuProcessor, effects: Effects) -> Self {
-        gpu.set_effects(effects.for_gpu());
-        Self::with_backend(Backend::Gpu(Box::new(gpu)))
-    }
-
+impl Backend {
     /// The backend chosen by `VIDEO_MENU_BACKEND`, defaulting to the GPU with
     /// a fallback to the CPU.
-    pub fn from_env(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let gpu = match std::env::var("VIDEO_MENU_BACKEND").as_deref() {
             Ok("cpu") => None,
             Ok("gpu") => Some(GpuProcessor::new()?),
@@ -128,63 +82,181 @@ impl Processor {
                 .ok(),
         };
         Ok(match gpu {
-            Some(gpu) => Self::on_gpu(gpu, effects),
-            None => Self::cpu(effects),
+            Some(gpu) => Self::Gpu(Box::new(gpu)),
+            None => Self::Cpu(Box::default()),
         })
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Cpu(_) => "CPU".into(),
+            Self::Gpu(gpu) => format!("GPU ({})", gpu.adapter_name()),
+        }
+    }
+
+    /// See [`CpuProcessor::set_model_size`].
+    pub fn set_model_size(&mut self, size: (usize, usize)) {
+        match self {
+            Self::Cpu(cpu) => cpu.set_model_size(size),
+            Self::Gpu(gpu) => gpu.set_model_size(size),
+        }
+    }
+
+    /// See [`CpuProcessor::reset_alpha`].
+    pub fn reset_alpha(&mut self) {
+        match self {
+            Self::Cpu(cpu) => cpu.reset_alpha(),
+            Self::Gpu(gpu) => gpu.reset_alpha(),
+        }
+    }
+
+    /// See [`CpuProcessor::ingest`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest(
+        &mut self,
+        slot: usize,
+        input: InputFormat,
+        src: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        background: Option<Background>,
+        model_input: Option<&[f16]>,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Cpu(cpu) => cpu.ingest(slot, input, src, src_stride, width, height, background, model_input),
+            Self::Gpu(gpu) => gpu.ingest(slot, input, src, src_stride, width, height, background, model_input),
+        }
+    }
+
+    /// The model input the last [`ingest`](Self::ingest) made.
+    pub fn model_input(&self) -> &[f16] {
+        match self {
+            Self::Cpu(cpu) => cpu.model_input(),
+            Self::Gpu(gpu) => gpu.model_input(),
+        }
+    }
+
+    /// See [`CpuProcessor::blur`].
+    pub fn blur(&mut self, slot: usize) {
+        match self {
+            Self::Cpu(cpu) => cpu.blur(slot),
+            Self::Gpu(gpu) => gpu.blur(slot),
+        }
+    }
+
+    /// See [`CpuProcessor::finish`].
+    pub fn finish(
+        &mut self,
+        slot: usize,
+        coefficients: Option<(&[f16], &[f16])>,
+        dst: &mut [u8],
+        dst_stride: usize,
+    ) -> Result<(), String> {
+        match self {
+            Self::Cpu(cpu) => cpu.finish(slot, coefficients, dst, dst_stride),
+            Self::Gpu(gpu) => gpu.finish(slot, coefficients, dst, dst_stride),
+        }
+    }
+
+    /// Note an event in the GPU profile, if profiling.
+    fn mark(&self, name: &'static str) {
+        if let Self::Gpu(gpu) = self {
+            gpu.mark(name);
+        }
+    }
+}
+
+/// Names of the stages [`Processor::process`] times. `decode` is zero for
+/// raw frames, `blur` without a blur, and `model` without a model.
+pub const STAGES: [&str; 5] = ["decode", "ingest", "blur", "model", "finish"];
+
+/// Runs frames through a backend and the matting model, one at a time.
+pub struct Processor {
+    backend: Backend,
+    /// The model, for an effect that runs one.
+    matting: Option<Matting>,
+    /// What the effect puts behind the person, if it runs the model.
+    background: Option<Background>,
+    /// Size of the last frame; temporal state is reset when it changes.
+    size: (usize, usize),
+    /// JPEG decoder, created on the first MJPG frame.
+    jpeg: Option<turbojpeg::Decompressor>,
+    /// The last decoded MJPG frame, as RGBx.
+    decoded: Vec<u8>,
+    /// Makes the model's input from MJPG frames, before the full decode.
+    early: EarlyInput,
+}
+
+impl Processor {
+    pub fn new(backend: Backend, effects: Effects) -> Self {
+        let mut processor = Self {
+            backend,
+            matting: None,
+            background: None,
+            size: (0, 0),
+            jpeg: None,
+            decoded: Vec::new(),
+            early: EarlyInput::default(),
+        };
+        processor.set_effects(effects);
+        processor
+    }
+
+    #[cfg(test)]
+    pub fn cpu(effects: Effects) -> Self {
+        Self::new(Backend::Cpu(Box::default()), effects)
+    }
+
+    #[cfg(test)]
+    pub fn gpu(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::new(Backend::Gpu(Box::new(GpuProcessor::new()?)), effects))
+    }
+
+    /// The backend chosen by `VIDEO_MENU_BACKEND`; see [`Backend::from_env`].
+    pub fn from_env(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::new(Backend::from_env()?, effects))
     }
 
     /// Replace the effects, e.g. to switch models.
     pub fn set_effects(&mut self, effects: Effects) {
-        match &mut self.backend {
-            Backend::Cpu(cpu) => cpu.effects = effects.for_cpu(),
-            Backend::Gpu(gpu) => gpu.set_effects(effects.for_gpu()),
-        }
+        (self.matting, self.background) = match effects {
+            Effects::None => (None, None),
+            Effects::Background(matting, background) => {
+                self.backend.set_model_size(matting.size());
+                (Some(matting), Some(background))
+            }
+        };
+        self.backend.reset_alpha();
     }
 
     /// The matting model the effects run, if any, to change its settings.
     pub fn matting_mut(&mut self) -> Option<&mut Matting> {
-        match &mut self.backend {
-            Backend::Cpu(cpu) => cpu.effects.iter_mut().find_map(|e| e.matting_mut()),
-            Backend::Gpu(gpu) => gpu.matting_mut(),
-        }
+        self.matting.as_mut()
     }
 
     /// Change what the background effect, if any, puts behind the person.
     pub fn set_background(&mut self, background: Background) {
-        match &mut self.backend {
-            Backend::Cpu(cpu) => cpu.effects.iter_mut().for_each(|e| e.set_background(background)),
-            Backend::Gpu(gpu) => gpu.set_background(background),
+        if self.background.is_some() {
+            self.background = Some(background);
         }
     }
 
     /// Forget effects' temporal state, e.g. after switching cameras.
     pub fn reset(&mut self) {
-        match &mut self.backend {
-            Backend::Cpu(cpu) => cpu.effects.iter_mut().for_each(|e| e.reset()),
-            Backend::Gpu(gpu) => gpu.reset(),
+        if let Some(matting) = &mut self.matting {
+            matting.reset();
         }
+        self.backend.reset_alpha();
     }
 
     pub fn describe(&self) -> String {
-        match &self.backend {
-            Backend::Cpu(_) => "CPU".into(),
-            Backend::Gpu(gpu) => format!("GPU ({})", gpu.adapter_name()),
-        }
-    }
-
-    /// Names of the stages [`process`](Self::process) times. `decode` is
-    /// zero for raw frames and `model` without a model-based effect.
-    pub fn stage_names(&self) -> [&'static str; 5] {
-        match &self.backend {
-            Backend::Cpu(_) => ["decode", "unpack", "effects", "model", "pack"],
-            Backend::Gpu(_) => ["decode", "upload", "gpu", "model", "readback"],
-        }
+        self.backend.describe()
     }
 
     /// Turn one `width`x`height` camera frame into YUY2 in `dst` (rows
     /// `dst_stride` apart, `dst_stride * height` bytes). `src_stride` is
-    /// ignored for MJPG. Returns the time of each stage named by
-    /// [`stage_names`](Self::stage_names).
+    /// ignored for MJPG. Returns the time of each stage in [`STAGES`].
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
@@ -196,15 +268,19 @@ impl Processor {
         dst: &mut [u8],
         dst_stride: usize,
     ) -> Result<[Duration; 5], String> {
+        if self.size != (width, height) {
+            self.reset();
+            self.size = (width, height);
+        }
         let mut early = false;
         let (input, src, src_stride, decode) = match format {
             FrameFormat::Raw(input) => (input, src, src_stride, Duration::ZERO),
             FrameFormat::Mjpg => {
                 let start = Instant::now();
-                // The model's input first, from a scaled-down decode, so a
-                // pipelined model can start before the full decode.
-                if let Some(size) = self.model_size() {
-                    early = self.early.make(src, (width, height), size)?;
+                // The model's input first, from a scaled-down decode, so the
+                // model can start before the full decode.
+                if let Some(matting) = &self.matting {
+                    early = self.early.make(src, (width, height), matting.size())?;
                 }
                 self.decode_jpeg(src, width, height)?;
                 let rgbx = InputFormat::from_video_format(VideoFormat::RGBx).unwrap();
@@ -212,34 +288,31 @@ impl Processor {
             }
         };
         let model_input = early.then_some(self.early.input.as_slice());
-        let [a, b, model, c] = match &mut self.backend {
-            Backend::Gpu(gpu) => gpu.process(input, src, src_stride, width, height, model_input, dst, dst_stride)?,
-            Backend::Cpu(cpu) => {
-                let t0 = Instant::now();
-                cpu.planar.resize(width, height);
-                if !pipeline::unpack(input, src, src_stride, &mut cpu.planar) {
-                    return Err(format!("short frame ({} bytes)", src.len()));
-                }
-                let t1 = Instant::now();
-                let mut model = Duration::ZERO;
-                for effect in &mut cpu.effects {
-                    effect.apply_with_input(&mut cpu.planar, model_input)?;
-                    model += effect.model_time();
-                }
-                let t2 = Instant::now();
-                pipeline::pack_yuy2_bt601(&cpu.planar, dst, dst_stride);
-                [t1 - t0, (t2 - t1).saturating_sub(model), model, t2.elapsed()]
-            }
-        };
-        Ok([decode, a, b, model, c])
-    }
+        let background = self.background.filter(|_| self.matting.is_some());
 
-    /// The resolution of the model the effects run, if any.
-    fn model_size(&mut self) -> Option<(usize, usize)> {
-        match &mut self.backend {
-            Backend::Cpu(cpu) => cpu.effects.iter().find_map(|e| e.model_size()),
-            Backend::Gpu(gpu) => gpu.matting_mut().map(|m| m.size()),
+        let t = Instant::now();
+        let wants_model = self.backend.ingest(0, input, src, src_stride, width, height, background, model_input)?;
+        let ingest = t.elapsed();
+        let (mut blur, mut model) = (Duration::ZERO, Duration::ZERO);
+        let t = Instant::now();
+        match self.matting.as_mut().filter(|_| wants_model) {
+            Some(matting) => {
+                self.backend.mark("model start");
+                matting.begin(self.backend.model_input())?;
+                let tb = Instant::now();
+                self.backend.blur(0);
+                blur = tb.elapsed();
+                let coefficients = matting.end()?;
+                self.backend.mark("model done");
+                let tf = Instant::now();
+                self.backend.finish(0, Some(coefficients), dst, dst_stride)?;
+                let finish = tf.elapsed();
+                model = matting.last_time();
+                return Ok([decode, ingest, blur, model, finish]);
+            }
+            None => self.backend.finish(0, None, dst, dst_stride)?,
         }
+        Ok([decode, ingest, blur, model, t.elapsed()])
     }
 
     /// Decode a JPEG frame into `self.decoded` as RGBx, checking it is the
@@ -506,8 +579,7 @@ mod tests {
                     }
                 }
                 let ms = |d: Duration| d.as_secs_f64() * 1e3 / FRAMES as f64;
-                let stages: Vec<String> = proc
-                    .stage_names()
+                let stages: Vec<String> = STAGES
                     .iter()
                     .zip(stages)
                     .map(|(n, t)| format!("{n} {:.2}", ms(t)))
@@ -601,7 +673,8 @@ mod tests {
                 }
                 let mut total = Duration::ZERO;
                 for _ in 0..FRAMES {
-                    total += gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut dst, w * 2).unwrap()[2];
+                    let t = gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut dst, w * 2).unwrap();
+                    total += t[1] + t[2] + t[4];
                 }
                 eprintln!("model {mw}x{mh}, {name}: gpu {:.2} ms/frame", total.as_secs_f64() * 1e3 / FRAMES as f64);
             }
@@ -712,8 +785,7 @@ mod tests {
             for _ in 0..FRAMES {
                 last = proc.process(FrameFormat::Mjpg, jpg, 0, w, h, &mut dst, w * 2).unwrap();
             }
-            let stages: Vec<String> = proc
-                .stage_names()
+            let stages: Vec<String> = STAGES
                 .iter()
                 .zip(last)
                 .map(|(n, t)| format!("{n} {:.2}", t.as_secs_f64() * 1e3))

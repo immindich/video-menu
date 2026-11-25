@@ -46,7 +46,7 @@ use crate::{
     formats::{self, CameraMode, CaptureFormat, serialize},
     pipeline::InputFormat,
     pipeline::Background,
-    processor::{Effects, FrameFormat, Processor},
+    processor::{Effects, FrameFormat, Processor, STAGES},
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -628,7 +628,7 @@ impl CameraRelay {
                 &mut st.frame,
                 st.stride,
             ) {
-                Ok(stages) => st.timing.record(stages, processor.stage_names()),
+                Ok(stages) => st.timing.record(stages, STAGES),
                 Err(e) => {
                     eprintln!("capture: dropping frame: {e}");
                     return;

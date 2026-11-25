@@ -12,29 +12,17 @@
 //! and packs. The full-resolution frame stays on the GPU throughout, in one
 //! of a few slots, so stages of different frames can overlap.
 
-use std::{
-    error::Error,
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+use std::{error::Error, sync::mpsc};
 
 use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::{
-    model::Matting,
     profile::GpuProfiler,
     pipeline::{self, Background, BlurGeometry, InputFormat, MAX_BLUR_TAPS},
 };
 
 const WORKGROUP: u32 = 16;
-
-/// An effect that runs on the GPU.
-pub enum GpuEffect {
-    /// Replace the background, using a matting model to find the person
-    /// (see [`pipeline::ReplaceBackground`]).
-    ReplaceBackground(Matting, Background),
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -132,35 +120,21 @@ pub struct GpuProcessor {
     /// Zero `coef_alpha` before the next blur: there is no finished frame
     /// since the last reset.
     clear_alpha: bool,
-    effects: Vec<GpuEffect>,
     shared: Option<Shared>,
     slots: Vec<Slot>,
-    /// Size of the last frame; models' temporal state is reset when it changes.
-    last_size: (usize, usize),
     /// Tightly packed copy of the input, used when its stride has padding.
     staging: Vec<u8>,
     /// The model input, copied out of `small_readback`.
     small_host: Vec<f16>,
     /// Resolution of the matting model, which sizes `small` and `coef`.
     model_size: (usize, usize),
-    /// Where the current frame's time went, for [`process`](Self::process).
-    times: Times,
     adapter_name: String,
     /// Records a timeline of each frame, if `VIDEO_MENU_GPU_PROFILE` is set.
     profiler: Option<GpuProfiler>,
 }
 
-/// Where the time for one frame went.
-#[derive(Default)]
-struct Times {
-    upload: Duration,
-    gpu: Duration,
-    model: Duration,
-    readback: Duration,
-}
-
 impl GpuProcessor {
-    /// Set up a hardware Vulkan device, with no effects. Fails if there is
+    /// Set up a hardware Vulkan device. Fails if there is
     /// none (a software rasterizer such as llvmpipe doesn't count).
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -241,7 +215,7 @@ impl GpuProcessor {
                 cache: None,
             })
         };
-        // Placeholders until set_effects knows the model's resolution.
+        // Placeholders until set_model_size gives the model's resolution.
         let model_size = (2, 1);
         let [small, small_readback, coef, coef4, coef_alpha] = model_buffers(&device, model_size);
 
@@ -268,115 +242,36 @@ impl GpuProcessor {
             device,
             queue,
             layout,
-            effects: Vec::new(),
             shared: None,
             slots: Vec::new(),
-            last_size: (0, 0),
             staging: Vec::new(),
             small_host: Vec::new(),
             model_size,
-            times: Times::default(),
             adapter_name: info.name,
         })
     }
 
-    pub fn set_effects(&mut self, effects: Vec<GpuEffect>) {
-        let model_size = effects.iter().map(|e| match e {
-            GpuEffect::ReplaceBackground(matte, _) => matte.size(),
-        }).next();
-        if let Some(size) = model_size
-            && size != self.model_size
-        {
+    /// Size the model's buffers for a model working at `size`, and forget
+    /// the last frame's alpha. Only call with no frames in flight.
+    pub fn set_model_size(&mut self, size: (usize, usize)) {
+        if size != self.model_size {
             [self.small, self.small_readback, self.coef, self.coef4, self.coef_alpha] =
                 model_buffers(&self.device, size);
-            self.clear_alpha = true;
             self.small_host = vec![f16::ZERO; 3 * size.0 * size.1];
             self.model_size = size;
             // The slots' bind groups refer to the old buffers.
             self.slots.clear();
         }
-        self.effects = effects;
-        self.last_size = (0, 0);
+        self.clear_alpha = true;
     }
 
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
 
-    /// The matting model the effects run, if any.
-    pub fn matting_mut(&mut self) -> Option<&mut Matting> {
-        self.effects.iter_mut().map(|e| match e {
-            GpuEffect::ReplaceBackground(matte, _) => matte,
-        }).next()
-    }
-
-    /// Change what the effects put behind the person.
-    pub fn set_background(&mut self, background: Background) {
-        for effect in &mut self.effects {
-            let GpuEffect::ReplaceBackground(_, bg) = effect;
-            *bg = background;
-        }
-    }
-
-    /// Forget effects' temporal state, e.g. after switching cameras.
-    pub fn reset(&mut self) {
+    /// Forget the last frame's alpha, e.g. after switching cameras.
+    pub fn reset_alpha(&mut self) {
         self.clear_alpha = true;
-        for effect in &mut self.effects {
-            let GpuEffect::ReplaceBackground(matte, _) = effect;
-            matte.reset();
-        }
-    }
-
-    /// Process one `width`x`height` camera frame into YUY2 in `dst` (rows
-    /// `dst_stride` apart), running the stages in order: [`ingest`],
-    /// the model, [`blur`] while the model works, and [`finish`]. Returns the
-    /// time spent uploading, waiting for the GPU, running models, and copying
-    /// the result out.
-    ///
-    /// [`ingest`]: Self::ingest
-    /// [`blur`]: Self::blur
-    /// [`finish`]: Self::finish
-    #[allow(clippy::too_many_arguments)]
-    pub fn process(
-        &mut self,
-        input: InputFormat,
-        src: &[u8],
-        src_stride: usize,
-        width: usize,
-        height: usize,
-        model_input: Option<&[f16]>,
-        dst: &mut [u8],
-        dst_stride: usize,
-    ) -> Result<[Duration; 4], String> {
-        if self.last_size != (width, height) {
-            self.reset();
-            self.last_size = (width, height);
-        }
-        // Only one background effect runs.
-        let background = self.effects.iter().map(|e| match e {
-            GpuEffect::ReplaceBackground(_, bg) => *bg,
-        }).next();
-        self.times = Times::default();
-        let wants_model = self.ingest(0, input, src, src_stride, width, height, background, model_input)?;
-        // Take the effects out so they can be borrowed alongside `self`.
-        let mut effects = std::mem::take(&mut self.effects);
-        let result = (|| {
-            let Some(GpuEffect::ReplaceBackground(matte, _)) = effects.first_mut().filter(|_| wants_model) else {
-                return self.finish(0, None, dst, dst_stride);
-            };
-            self.mark("model start");
-            matte.begin(self.model_input())?;
-            self.blur(0);
-            let (a, b) = matte.end()?;
-            self.mark("model done");
-            let result = self.finish(0, Some((a, b)), dst, dst_stride);
-            self.times.model = matte.last_time();
-            result
-        })();
-        self.effects = effects;
-        result?;
-        let t = &self.times;
-        Ok([t.upload, t.gpu, t.model, t.readback])
     }
 
     /// Upload a camera frame into `slot` and convert it to planar RGB there,
@@ -400,7 +295,6 @@ impl GpuProcessor {
         if !width.is_multiple_of(2) || !pipeline::frame_fits(input, src.len(), src_stride, width, height) {
             return Err(format!("short or odd-sized frame ({} bytes)", src.len()));
         }
-        let t0 = Instant::now();
         let blur = match background {
             Some(Background::Blur { radius }) => Some(BlurGeometry::new(width, height, radius)),
             _ => None,
@@ -427,7 +321,6 @@ impl GpuProcessor {
         let params = self.params(input, width, height, background, blur.as_ref());
         self.queue.write_buffer(&self.slots[slot].params, 0, bytemuck::bytes_of(&params));
         self.slots[slot].job = Some(Job { width, height, background, blur, blurred: false });
-        self.times.upload += t0.elapsed();
         self.mark("uploaded");
 
         // The model's input first, straight from the camera's bytes, and its
@@ -453,7 +346,6 @@ impl GpuProcessor {
             self.submitted("model input");
             (index, bytes)
         });
-        let t = Instant::now();
         let (w, h) = (width as u32, height as u32);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         match input {
@@ -466,7 +358,6 @@ impl GpuProcessor {
             return Ok(background.is_some());
         };
         self.wait_mapped(&self.small_readback, bytes, index)?;
-        self.times.gpu += t.elapsed();
         self.mark("model input waited");
         {
             let mapped = self
@@ -530,10 +421,8 @@ impl GpuProcessor {
             if let Some(g) = job.blur.filter(|_| !job.blurred) {
                 self.record_blur(&mut encoder, slot, &g);
             }
-            let t = Instant::now();
             self.queue.write_buffer(&self.coef, 0, bytemuck::cast_slice(a));
             self.queue.write_buffer(&self.coef, (a.len() * 2) as u64, bytemuck::cast_slice(b));
-            self.times.upload += t.elapsed();
             // unpack_coef replaces the alpha coefficients with this frame's.
             self.clear_alpha = false;
             let (mw, mh) = self.model_size;
@@ -552,14 +441,11 @@ impl GpuProcessor {
         if let Some(p) = &self.profiler {
             p.resolve(&mut encoder);
         }
-        let t1 = Instant::now();
         let index = self.queue.submit([encoder.finish()]);
         self.submitted("output");
         self.wait_mapped(&shared.readback, out_bytes, index)?;
-        self.times.gpu += t1.elapsed();
         self.mark("output waited");
 
-        let t2 = Instant::now();
         {
             let mapped = shared
                 .readback
@@ -572,7 +458,6 @@ impl GpuProcessor {
             }
         }
         shared.readback.unmap();
-        self.times.readback += t2.elapsed();
         if let Some(p) = &self.profiler {
             p.mark("output copied");
             p.finish(&self.device);
@@ -624,7 +509,8 @@ impl GpuProcessor {
         params
     }
 
-    fn mark(&self, name: &'static str) {
+    /// Note an event in the profile, if profiling.
+    pub fn mark(&self, name: &'static str) {
         if let Some(p) = &self.profiler {
             p.mark(name);
         }
@@ -765,10 +651,7 @@ mod tests {
     use pipewire::spa::param::video::VideoFormat;
 
     use super::*;
-    use crate::{
-        model::fake::FakeMatte,
-        pipeline::{PlanarFrame, resample, unpack},
-    };
+    use crate::pipeline::{PlanarFrame, resample, unpack};
 
     /// The model input the GPU makes from the camera's bytes matches the
     /// CPU's (unpack, then resample) to within one f16 step.
@@ -784,8 +667,7 @@ mod tests {
             ("YUY2", InputFormat::Yuy2),
         ];
         for (mw, mh) in [(480, 270), (256, 144)] {
-            let matting = Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false);
-            gpu.set_effects(vec![GpuEffect::ReplaceBackground(matting, Background::Color([0.0; 3]))]);
+            gpu.set_model_size((mw, mh));
             for (w, h) in [(200, 120), (70, 37), (640, 360)] {
                 for (name, format) in formats {
                     let stride = format.row_bytes(w) + 8;
