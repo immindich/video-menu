@@ -19,7 +19,7 @@ use half::f16;
 
 use crate::{
     model::Matting,
-    pipeline::{self, Background, BlurGeometry, InputFormat},
+    pipeline::{self, Background, BlurGeometry, InputFormat, MAX_BLUR_TAPS},
 };
 
 const WORKGROUP: u32 = 16;
@@ -50,8 +50,8 @@ struct Params {
     blur_h: u32,
     blur_factor: u32,
     blur_taps: u32,
-    blur_sigma: f32,
-    _pad3: [u32; 3],
+    /// The blur kernel's weights for offsets 0..=blur_taps.
+    blur_weights: [f32; MAX_BLUR_TAPS + 1],
 }
 
 /// GPU buffers sized for one frame size; reallocated when it changes.
@@ -61,6 +61,9 @@ struct Frame {
     input: wgpu::Buffer,
     output: wgpu::Buffer,
     readback: wgpu::Buffer,
+    /// Samples the blur buffers hold; they grow when a smaller blur needs
+    /// a bigger copy of the frame.
+    blur_len: usize,
     bind_group: wgpu::BindGroup,
 }
 
@@ -71,6 +74,7 @@ pub struct GpuProcessor {
     unpack_packed: wgpu::ComputePipeline,
     unpack_yuy2: wgpu::ComputePipeline,
     downsample: wgpu::ComputePipeline,
+    unpack_coef: wgpu::ComputePipeline,
     composite_color: wgpu::ComputePipeline,
     blur_down: wgpu::ComputePipeline,
     blur_h: wgpu::ComputePipeline,
@@ -83,6 +87,17 @@ pub struct GpuProcessor {
     small_readback: wgpu::Buffer,
     /// The model's output (f16 A then b), read by the composite passes.
     coef: wgpu::Buffer,
+    /// The coefficients unpacked to f32 and interleaved, A then b for each
+    /// model pixel, by `unpack_coef`: the composite passes sample them at
+    /// every frame pixel, and one load of a vec4 beats four of packed f16.
+    coef4: wgpu::Buffer,
+    /// Just the alpha coefficients (A and b), which `blur_down` needs. It
+    /// runs while the model works on the frame, so it reads the previous
+    /// frame's.
+    coef_alpha: wgpu::Buffer,
+    /// Zero `coef_alpha` before the next frame: the previous frame's matte
+    /// is of something else (after a reset) or of nothing (at first).
+    clear_alpha: bool,
     effects: Vec<GpuEffect>,
     frame: Option<Frame>,
     /// Size of the last frame; models' temporal state is reset when it changes.
@@ -160,6 +175,8 @@ impl GpuProcessor {
                 storage(5, true),
                 storage(6, false),
                 storage(7, false),
+                storage(8, false),
+                storage(9, false),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -188,12 +205,13 @@ impl GpuProcessor {
         use wgpu::BufferUsages as U;
         // Placeholders until set_effects knows the model's resolution.
         let model_size = (2, 1);
-        let (small, small_readback, coef) = model_buffers(&device, model_size);
+        let [small, small_readback, coef, coef4, coef_alpha] = model_buffers(&device, model_size);
 
         Ok(Self {
             unpack_packed: pipeline("unpack_packed"),
             unpack_yuy2: pipeline("unpack_yuy2"),
             downsample: pipeline("downsample"),
+            unpack_coef: pipeline("unpack_coef"),
             composite_color: pipeline("composite_color"),
             blur_down: pipeline("blur_down"),
             blur_h: pipeline("blur_h"),
@@ -204,6 +222,9 @@ impl GpuProcessor {
             small,
             small_readback,
             coef,
+            coef4,
+            coef_alpha,
+            clear_alpha: true,
             device,
             queue,
             layout,
@@ -224,7 +245,9 @@ impl GpuProcessor {
         if let Some(size) = model_size
             && size != self.model_size
         {
-            (self.small, self.small_readback, self.coef) = model_buffers(&self.device, size);
+            [self.small, self.small_readback, self.coef, self.coef4, self.coef_alpha] =
+                model_buffers(&self.device, size);
+            self.clear_alpha = true;
             self.small_host = vec![f16::ZERO; 3 * size.0 * size.1];
             self.model_size = size;
             // The bind group refers to the old buffers.
@@ -255,6 +278,7 @@ impl GpuProcessor {
 
     /// Forget effects' temporal state, e.g. after switching cameras.
     pub fn reset(&mut self) {
+        self.clear_alpha = true;
         for effect in &mut self.effects {
             let GpuEffect::ReplaceBackground(matte, _) = effect;
             matte.reset();
@@ -283,7 +307,20 @@ impl GpuProcessor {
             self.last_size = (width, height);
         }
         let t0 = Instant::now();
-        self.ensure_frame(width, height);
+        // Only one background effect runs, so its settings can live in
+        // the shared parameters.
+        let background = self.effects.iter().map(|e| match e {
+            GpuEffect::ReplaceBackground(_, bg) => *bg,
+        }).next();
+        let bg = match background {
+            Some(Background::Color(c)) => [c[0], c[1], c[2], 1.0],
+            _ => [0.0; 4],
+        };
+        let blur = match background {
+            Some(Background::Blur { radius }) => Some(BlurGeometry::new(width, height, radius)),
+            _ => None,
+        };
+        self.ensure_frame(width, height, blur.map_or(0, |g| g.len()));
 
         // Upload, dropping any row padding so the shader can index rows tightly.
         let row_bytes = input.row_bytes(width);
@@ -302,21 +339,7 @@ impl GpuProcessor {
             InputFormat::Packed { r, g, b, .. } => (r, g, b),
             InputFormat::Yuy2 => (0, 0, 0),
         };
-        // Only one background effect runs, so its settings can live in
-        // the shared parameters.
-        let background = self.effects.iter().map(|e| match e {
-            GpuEffect::ReplaceBackground(_, bg) => *bg,
-        }).next();
-        let bg = match background {
-            Some(Background::Color(c)) => [c[0], c[1], c[2], 1.0],
-            _ => [0.0; 4],
-        };
-        let radius = match background {
-            Some(Background::Blur { radius }) => radius,
-            _ => 1.0,
-        };
-        let blur = BlurGeometry::new(width, height, radius);
-        let params = Params {
+        let mut params = Params {
             width: width as u32,
             height: height as u32,
             src_words: (row_bytes / 4) as u32,
@@ -329,19 +352,27 @@ impl GpuProcessor {
             small_h: self.model_size.1 as u32,
             _pad1: [0; 2],
             bg,
-            blur_w: blur.width as u32,
-            blur_h: blur.height as u32,
-            blur_factor: blur.factor as u32,
-            blur_taps: blur.taps as u32,
-            blur_sigma: blur.sigma,
-            _pad3: [0; 3],
+            blur_w: 0,
+            blur_h: 0,
+            blur_factor: 0,
+            blur_taps: 0,
+            blur_weights: [0.0; MAX_BLUR_TAPS + 1],
         };
+        if let Some(g) = &blur {
+            (params.blur_w, params.blur_h) = (g.width as u32, g.height as u32);
+            (params.blur_factor, params.blur_taps) = (g.factor as u32, g.taps as u32);
+            let weights = g.weights();
+            params.blur_weights[..weights.len()].copy_from_slice(&weights);
+        }
         self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let mut times = Times { upload: t0.elapsed(), gpu: Duration::ZERO, model: Duration::ZERO };
 
         let (w, h) = (width as u32, height as u32);
         let pairs = w / 2;
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        if std::mem::take(&mut self.clear_alpha) {
+            encoder.clear_buffer(&self.coef_alpha, 0, None);
+        }
         match input {
             InputFormat::Packed { .. } => self.dispatch(&mut encoder, &self.unpack_packed, w, h),
             InputFormat::Yuy2 => self.dispatch(&mut encoder, &self.unpack_yuy2, pairs, h),
@@ -352,20 +383,23 @@ impl GpuProcessor {
         for effect in &mut effects {
             match effect {
                 GpuEffect::ReplaceBackground(matte, background) => {
-                    result = self.run_model(&mut encoder, matte, &mut times);
+                    // The blur weighs pixels by the previous frame's matte, so
+                    // it can run on the GPU while the model works.
+                    let blur = match background {
+                        Background::Blur { .. } => blur,
+                        Background::Color(_) => None,
+                    };
+                    result = self.run_model(&mut encoder, matte, &mut times, blur);
                     if result.is_err() {
                         break;
                     }
-                    match background {
-                        Background::Color(_) => self.dispatch(&mut encoder, &self.composite_color, w, h),
-                        Background::Blur { .. } => {
-                            let (bw, bh) = (blur.width as u32, blur.height as u32);
-                            self.dispatch(&mut encoder, &self.blur_down, bw, bh);
-                            self.dispatch(&mut encoder, &self.blur_h, bw, bh);
-                            self.dispatch(&mut encoder, &self.blur_v, bw, bh);
-                            self.dispatch(&mut encoder, &self.composite_blur, w, h);
-                        }
-                    }
+                    let (mw, mh) = self.model_size;
+                    self.dispatch(&mut encoder, &self.unpack_coef, mw as u32, mh as u32);
+                    let composite = match background {
+                        Background::Color(_) => &self.composite_color,
+                        Background::Blur { .. } => &self.composite_blur,
+                    };
+                    self.dispatch(&mut encoder, composite, w, h);
                 }
             }
         }
@@ -399,12 +433,15 @@ impl GpuProcessor {
 
     /// Finish the GPU work recorded in `encoder` with a downsample to the
     /// model's input, run the model on it, and upload its output to `coef`.
-    /// `encoder` is replaced with a fresh one for the rest of the frame.
+    /// With `blur`, the blur of the background is started on the GPU before
+    /// the model runs. `encoder` is replaced with a fresh one for the rest
+    /// of the frame.
     fn run_model(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         matte: &mut Matting,
         times: &mut Times,
+        blur: Option<BlurGeometry>,
     ) -> Result<(), String> {
         let (mw, mh) = self.model_size;
         self.dispatch(encoder, &self.downsample, (mw / 2) as u32, mh as u32);
@@ -426,6 +463,14 @@ impl GpuProcessor {
         }
         self.small_readback.unmap();
 
+        if let Some(g) = blur {
+            let mut blur_encoder = self.device.create_command_encoder(&Default::default());
+            let (bw, bh) = (g.width as u32, g.height as u32);
+            self.dispatch(&mut blur_encoder, &self.blur_down, bw, bh);
+            self.dispatch(&mut blur_encoder, &self.blur_h, bw, bh);
+            self.dispatch(&mut blur_encoder, &self.blur_v, bw, bh);
+            self.queue.submit([blur_encoder.finish()]);
+        }
         let (a, b) = matte.run(&self.small_host)?;
         let t = Instant::now();
         self.queue.write_buffer(&self.coef, 0, bytemuck::cast_slice(a));
@@ -457,11 +502,13 @@ impl GpuProcessor {
             .map_err(|e| format!("GPU readback failed: {e}"))
     }
 
-    fn ensure_frame(&mut self, width: usize, height: usize) {
+    /// Make sure the frame buffers fit a `width`x`height` frame and the
+    /// blur buffers hold `blur_len` samples.
+    fn ensure_frame(&mut self, width: usize, height: usize, blur_len: usize) {
         if self
             .frame
             .as_ref()
-            .is_some_and(|f| (f.width, f.height) == (width, height))
+            .is_some_and(|f| (f.width, f.height) == (width, height) && f.blur_len >= blur_len)
         {
             return;
         }
@@ -480,9 +527,11 @@ impl GpuProcessor {
         let planar = buffer("planar", pixels * 3 * 4, U::STORAGE);
         let output = buffer("output", pixels * 2, U::STORAGE | U::COPY_SRC);
         let readback = buffer("readback", pixels * 2, U::MAP_READ | U::COPY_DST);
-        // The blur's scaled-down size depends only on the frame's.
-        let geometry = BlurGeometry::new(width, height, 1.0);
-        let blur_bytes = (4 * geometry.width * geometry.height * 4) as u64;
+        // Keep what blur buffers there were, if bigger. (Buffers can't be
+        // empty.)
+        let same_size = self.frame.as_ref().filter(|f| (f.width, f.height) == (width, height));
+        let blur_len = blur_len.max(same_size.map_or(0, |f| f.blur_len)).max(1);
+        let blur_bytes = (blur_len * 4) as u64;
         let blur_a = buffer("blur a", blur_bytes, U::STORAGE);
         let blur_b = buffer("blur b", blur_bytes, U::STORAGE);
         fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -498,28 +547,33 @@ impl GpuProcessor {
                 entry(3, &output),
                 entry(4, &self.small),
                 entry(5, &self.coef),
+                entry(8, &self.coef4),
+                entry(9, &self.coef_alpha),
                 entry(6, &blur_a),
                 entry(7, &blur_b),
             ],
         });
-        self.frame = Some(Frame { width, height, input, output, readback, bind_group });
+        self.frame = Some(Frame { width, height, input, output, readback, blur_len, bind_group });
     }
 }
 
 /// Buffers for a matting model working at `(w, h)`: the frame at that
 /// resolution (f16, written by `downsample`), its CPU readback copy, and the
-/// model's coefficients (f16 A then b, read by the composite passes). The shaders
-/// pack two f16 per word, so `w` must be even.
-fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+/// model's coefficients (f16 A then b, as the model returns them), the same
+/// unpacked for the composite passes, and just alpha's for `blur_down`. The
+/// shaders pack two f16 per word, so `w` must be even.
+fn model_buffers(device: &wgpu::Device, (w, h): (usize, usize)) -> [wgpu::Buffer; 5] {
     assert!(w.is_multiple_of(2), "model width must be even");
     let buffer = |label, size, usage| {
         device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
     };
     use wgpu::BufferUsages as U;
     let small_bytes = (3 * w * h * 2) as u64;
-    (
+    [
         buffer("small", small_bytes, U::STORAGE | U::COPY_SRC),
         buffer("small readback", small_bytes, U::MAP_READ | U::COPY_DST),
         buffer("coef", (8 * w * h * 2) as u64, U::STORAGE | U::COPY_DST),
-    )
+        buffer("coef4", (8 * w * h * 4) as u64, U::STORAGE),
+        buffer("coef alpha", (2 * w * h * 4) as u64, U::STORAGE | U::COPY_DST),
+    ]
 }

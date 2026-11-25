@@ -205,9 +205,19 @@ pub enum Background {
     Blur { radius: f32 },
 }
 
-/// The blur works on a copy of the frame scaled down to about this many
-/// rows, which makes a wide blur cheap and looks no different.
-const BLUR_ROWS: usize = 270;
+/// The blur works on a copy of the frame scaled down so that its standard
+/// deviation is about this many samples: a wide blur leaves no detail that
+/// the smaller copy would lose, and the kernel stays short.
+const BLUR_SIGMA: f32 = 2.5;
+
+/// The most the frame is scaled down for the blur. Beyond this, each sample
+/// averages so many pixels that the GPU has too few threads to keep busy,
+/// so the kernel grows instead.
+const BLUR_MAX_FACTOR: usize = 8;
+
+/// Kernel taps either side of the centre are limited to this (the GPU's
+/// weight array holds `MAX_BLUR_TAPS + 1`); bigger blurs scale down further.
+pub const MAX_BLUR_TAPS: usize = 63;
 
 /// How much the person counts towards the blurred background. Not zero, so
 /// the weights never vanish where the person covers a whole neighbourhood
@@ -229,15 +239,33 @@ pub struct BlurGeometry {
 
 impl BlurGeometry {
     pub fn new(width: usize, height: usize, radius: f32) -> Self {
-        let factor = ((height + BLUR_ROWS / 2) / BLUR_ROWS).max(1);
-        let sigma = (radius / 100.0 * height as f32 / factor as f32).max(0.3);
+        let full = radius / 100.0 * height as f32;
+        let by_sigma = ((full / BLUR_SIGMA).round() as usize).clamp(1, BLUR_MAX_FACTOR);
+        let by_taps = (3.0 * full / MAX_BLUR_TAPS as f32).ceil() as usize;
+        let factor = by_sigma.max(by_taps).max(1);
+        let sigma = (full / factor as f32).max(0.3);
         Self {
             factor,
             width: width.div_ceil(factor),
             height: height.div_ceil(factor),
             sigma,
-            taps: (3.0 * sigma).ceil() as usize,
+            taps: ((3.0 * sigma).ceil() as usize).min(MAX_BLUR_TAPS),
         }
+    }
+
+    /// Samples in the scaled-down copy: four planes of `width`x`height`.
+    pub fn len(&self) -> usize {
+        4 * self.width * self.height
+    }
+
+    /// The normalised Gaussian kernel's weights for offsets 0..=taps (it is
+    /// symmetric). Both backends use these.
+    pub fn weights(&self) -> Vec<f32> {
+        let k: Vec<f32> = (0..=self.taps)
+            .map(|d| (-((d * d) as f32) / (2.0 * self.sigma * self.sigma)).exp())
+            .collect();
+        let sum = k[0] + 2.0 * k[1..].iter().sum::<f32>();
+        k.into_iter().map(|v| v / sum).collect()
     }
 }
 
@@ -275,20 +303,11 @@ fn blur_down(rgb: [&[f32]; 3], alpha: &[f32], width: usize, height: usize, g: &B
     }
 }
 
-/// The normalised Gaussian kernel for `g`, `2 * taps + 1` long.
-fn gaussian(g: &BlurGeometry) -> Vec<f32> {
-    let t = g.taps as isize;
-    let k: Vec<f32> = (-t..=t)
-        .map(|d| (-((d * d) as f32) / (2.0 * g.sigma * g.sigma)).exp())
-        .collect();
-    let sum: f32 = k.iter().sum();
-    k.into_iter().map(|v| v / sum).collect()
-}
-
-/// Blur four planes of `g`'s size from `src` into `dst` along one axis,
-/// clamping at the edges. `pipeline.wgsl`'s `blur_h` and `blur_v` compute
-/// the same.
-fn blur_pass(src: &[f32], dst: &mut [f32], g: &BlurGeometry, kernel: &[f32], horizontal: bool) {
+/// Blur four planes of `g`'s size from `src` into `dst` along one axis
+/// with `weights` (from [`BlurGeometry::weights`]), clamping at the edges.
+/// `pipeline.wgsl`'s `blur_h` and `blur_v` compute the same, in the same
+/// order.
+fn blur_pass(src: &[f32], dst: &mut [f32], g: &BlurGeometry, weights: &[f32], horizontal: bool) {
     let (w, h) = (g.width, g.height);
     let t = g.taps as isize;
     for c in 0..4 {
@@ -296,7 +315,8 @@ fn blur_pass(src: &[f32], dst: &mut [f32], g: &BlurGeometry, kernel: &[f32], hor
         for y in 0..h {
             for x in 0..w {
                 let mut sum = 0.0;
-                for (k, d) in kernel.iter().zip(-t..=t) {
+                for d in -t..=t {
+                    let k = weights[d.unsigned_abs()];
                     let i = if horizontal {
                         y * w + (x as isize + d).clamp(0, w as isize - 1) as usize
                     } else {
@@ -353,7 +373,10 @@ fn resample(src: &[f32], w: usize, h: usize, dst: &mut [f32], dw: usize, dh: usi
 ///
 /// For a blur, the background is the frame scaled down, blurred with each
 /// pixel weighted by how much it is background (so the person doesn't bleed
-/// into it as a halo), and sampled back up.
+/// into it as a halo), and sampled back up. The weights come from the
+/// previous frame's matte, so that on the GPU the blur can run while the
+/// model works on this one; only moving edges see the difference, for a
+/// frame.
 pub struct ReplaceBackground {
     matte: Matting,
     background: Background,
@@ -364,8 +387,13 @@ pub struct ReplaceBackground {
     small16: Vec<f16>,
     coef: Vec<f32>,
     coef_full: Vec<f32>,
-    /// Blur scratch: alpha at full resolution, the two scaled-down buffers
-    /// the blur passes between, and the result back at full resolution.
+    /// The previous frame's alpha coefficients (A, then b) at the model's
+    /// resolution, for the blur's weights; zero (no person) at first.
+    prev_alpha_coef: Vec<f32>,
+    /// Blur scratch: those coefficients and alpha at full resolution, the
+    /// two scaled-down buffers the blur passes between, and the result back
+    /// at full resolution.
+    alpha_coef: Vec<f32>,
     alpha: Vec<f32>,
     blur: [Vec<f32>; 2],
     blurred: Vec<f32>,
@@ -382,6 +410,8 @@ impl ReplaceBackground {
             small16: vec![f16::ZERO; 3 * mw * mh],
             coef: vec![0.0; 8 * mw * mh],
             coef_full: Vec::new(),
+            prev_alpha_coef: vec![0.0; 2 * mw * mh],
+            alpha_coef: Vec::new(),
             alpha: Vec::new(),
             blur: Default::default(),
             blurred: Vec::new(),
@@ -389,22 +419,26 @@ impl ReplaceBackground {
     }
 
     /// Blur the background of `frame` into `self.blurred`: four planes at
-    /// full resolution, weighted colour and then the weight.
+    /// full resolution, weighted colour and then the weight. Uses the
+    /// previous frame's matte.
     fn blur_background(&mut self, frame: &PlanarFrame, radius: f32) {
         let (w, h) = (frame.width(), frame.height());
         let pixels = w * h;
-        let c = |k: usize| &self.coef_full[k * pixels..][..pixels];
+        let (mw, mh) = self.matte.size();
+        self.alpha_coef.resize(2 * pixels, 0.0);
+        resample(&self.prev_alpha_coef, mw, mh, &mut self.alpha_coef, w, h, 2);
+        let (ca, cb) = self.alpha_coef.split_at(pixels);
         let [rp, gp, bp] = frame.planes();
         self.alpha.resize(pixels, 0.0);
         for (i, a) in self.alpha.iter_mut().enumerate() {
             let gray = (rp[i] + gp[i] + bp[i]) * (1.0 / 3.0);
-            *a = (c(3)[i] * gray + c(7)[i]).clamp(0.0, 1.0);
+            *a = (ca[i] * gray + cb[i]).clamp(0.0, 1.0);
         }
         let g = BlurGeometry::new(w, h, radius);
-        let kernel = gaussian(&g);
+        let kernel = g.weights();
         let [a, b] = &mut self.blur;
-        a.resize(4 * g.width * g.height, 0.0);
-        b.resize(4 * g.width * g.height, 0.0);
+        a.resize(g.len(), 0.0);
+        b.resize(g.len(), 0.0);
         blur_down(frame.planes(), &self.alpha, w, h, &g, a);
         blur_pass(a, b, &g, &kernel, true);
         blur_pass(b, a, &g, &kernel, false);
@@ -417,9 +451,16 @@ impl Effect for ReplaceBackground {
     fn apply(&mut self, frame: &mut PlanarFrame) -> Result<(), String> {
         let (w, h) = (frame.width(), frame.height());
         if self.size != (w, h) {
-            self.matte.reset();
+            self.reset();
             self.size = (w, h);
         }
+        let blurred = match self.background {
+            Background::Blur { radius } => {
+                self.blur_background(frame, radius);
+                true
+            }
+            Background::Color(_) => false,
+        };
         let (mw, mh) = self.matte.size();
         resample(&frame.data, w, h, &mut self.small, mw, mh, 3);
         self.small16.convert_from_f32_slice(&self.small);
@@ -427,6 +468,9 @@ impl Effect for ReplaceBackground {
         let n = 4 * mw * mh;
         a.convert_to_f32_slice(&mut self.coef[..n]);
         b.convert_to_f32_slice(&mut self.coef[n..]);
+        let m = mw * mh;
+        self.prev_alpha_coef[..m].copy_from_slice(&self.coef[3 * m..4 * m]);
+        self.prev_alpha_coef[m..].copy_from_slice(&self.coef[7 * m..8 * m]);
 
         // Upsample all 8 coefficient planes (A then b) to the frame size.
         let pixels = w * h;
@@ -435,11 +479,9 @@ impl Effect for ReplaceBackground {
 
         let color = match self.background {
             Background::Color(color) => Some(color),
-            Background::Blur { radius } => {
-                self.blur_background(frame, radius);
-                None
-            }
+            Background::Blur { .. } => None,
         };
+        debug_assert_eq!(color.is_none(), blurred);
         let [rp, gp, bp] = frame.planes_mut();
         let c = |k: usize| &self.coef_full[k * pixels..][..pixels];
         let blurred = |k: usize| &self.blurred[k * pixels..][..pixels];
@@ -465,6 +507,7 @@ impl Effect for ReplaceBackground {
 
     fn reset(&mut self) {
         self.matte.reset();
+        self.prev_alpha_coef.fill(0.0);
     }
 
     fn matting_mut(&mut self) -> Option<&mut Matting> {
@@ -591,16 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn blur_geometry_scales_with_frame_height() {
+    fn blur_geometry_keeps_the_kernel_short() {
+        // 2% of 1080 rows is a 21.6-pixel standard deviation: scaled down
+        // by 8 (the most) it is 2.7 samples.
         let hd = BlurGeometry::new(1920, 1080, 2.0);
-        assert_eq!((hd.factor, hd.width, hd.height), (4, 480, 270));
-        assert!((hd.sigma - 5.4).abs() < 1e-4 && hd.taps == 17, "{hd:?}");
-        // 720p blurs at a third of its size, by the same share of the height.
-        let hd720 = BlurGeometry::new(1280, 720, 2.0);
-        assert_eq!((hd720.factor, hd720.width, hd720.height), (3, 427, 240));
-        assert!((hd720.sigma * 3.0 - 14.4).abs() < 1e-3);
-        // Small frames aren't scaled at all.
-        assert_eq!(BlurGeometry::new(70, 37, 2.0).factor, 1);
+        assert_eq!((hd.factor, hd.width, hd.height, hd.taps), (8, 240, 135, 9), "{hd:?}");
+        assert!((hd.sigma - 2.7).abs() < 1e-4, "{hd:?}");
+        // Small blurs barely scale down.
+        let small = BlurGeometry::new(1920, 1080, 0.25);
+        assert_eq!(small.factor, 1, "{small:?}");
+        // Big blurs on big frames keep within the tap limit.
+        let big = BlurGeometry::new(3840, 2160, 8.0);
+        assert!(big.taps <= MAX_BLUR_TAPS && big.factor > BLUR_MAX_FACTOR, "{big:?}");
+        assert!((big.sigma * big.factor as f32 - 172.8).abs() < 1e-2);
+        // The kernel sums to one.
+        let w = hd.weights();
+        assert!((w[0] + 2.0 * w[1..].iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
     /// The blurred background of a frame whose left half is a red person
@@ -615,8 +664,7 @@ mod tests {
         let n = width * h;
         let (mut a, mut b) = (vec![0.0; 4 * n], vec![0.0; 4 * n]);
         blur_down(frame.planes(), &alpha, width, h, &g, &mut a);
-        let kernel = gaussian(&g);
-        assert!((kernel.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        let kernel = g.weights();
         blur_pass(&a, &mut b, &g, &kernel, true);
         blur_pass(&b, &mut a, &g, &kernel, false);
         (0..width).map(|x| [0, 1, 2].map(|c| a[c * n + 3 * width + x] / a[3 * n + 3 * width + x])).collect()
@@ -644,7 +692,7 @@ mod tests {
         let n = g.width * g.height;
         let (mut a, mut b) = (vec![0.0; 4 * n], vec![0.0; 4 * n]);
         blur_down(frame.planes(), &alpha, w, h, &g, &mut a);
-        let kernel = gaussian(&g);
+        let kernel = g.weights();
         blur_pass(&a, &mut b, &g, &kernel, true);
         blur_pass(&b, &mut a, &g, &kernel, false);
         for (c, want) in [0.2, 0.4, 0.6].into_iter().enumerate() {

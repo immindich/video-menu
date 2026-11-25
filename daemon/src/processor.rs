@@ -476,12 +476,17 @@ mod tests {
 
     fn background_matches(mut gpu: Processor, mut cpu: Processor, (mw, mh): (usize, usize), bg: Background) {
         // Not the model's aspect ratio, and not a multiple of the workgroup;
-        // the last is tall enough that the blur scales it down (by 3).
+        // the last is big enough that the blur scales it down. Two different
+        // frames at each size, as the blur weighs by the previous frame's
+        // matte.
         for (w, h) in [(200, 120), (70, 37), (642, 722)] {
-            let src = pattern(rgbx(), w, h, w * 4);
+            let first = pattern(rgbx(), w, h, w * 4);
+            let src: Vec<u8> = first.iter().map(|v| 255 - v).collect();
             let (mut a, mut b) = (vec![0u8; w * 2 * h], vec![0u8; w * 2 * h]);
-            cpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut a, w * 2).unwrap();
-            gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut b, w * 2).unwrap();
+            for frame in [&first, &src] {
+                cpu.process(FrameFormat::Raw(rgbx()), frame, w * 4, w, h, &mut a, w * 2).unwrap();
+                gpu.process(FrameFormat::Raw(rgbx()), frame, w * 4, w, h, &mut b, w * 2).unwrap();
+            }
             let diffs: Vec<u8> = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).collect();
             let worst = *diffs.iter().max().unwrap();
             let off = diffs.iter().filter(|&&d| d > 0).count();
@@ -490,6 +495,37 @@ mod tests {
             // differently in the last bit; allow that to show through.
             assert!(worst <= 2, "{w}x{h}: GPU differs from CPU by up to {worst}");
             assert!(off * 100 < a.len(), "{w}x{h}: {off} bytes differ");
+        }
+    }
+
+    /// GPU time of each background at 1080p with a stand-in model (so only
+    /// the GPU work is measured). Run with
+    /// `cargo test --release -- --ignored --nocapture bench_backgrounds`.
+    #[test]
+    #[ignore]
+    fn bench_backgrounds() {
+        use crate::model::fake::FakeMatte;
+        const FRAMES: u32 = 200;
+        let (w, h) = (1920, 1080);
+        let src = pattern(rgbx(), w, h, w * 4);
+        let mut dst = vec![0u8; w * 2 * h];
+        let cases = [("none", None), ("color", Some(GREEN)), ("blur 2%", Some(Background::Blur { radius: 2.0 })), ("blur 8%", Some(Background::Blur { radius: 8.0 }))];
+        for (mw, mh) in [(480, 270), (256, 144)] {
+            for (name, bg) in cases {
+                let effects = match bg {
+                    None => Effects::None,
+                    Some(bg) => Effects::Background(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false), bg),
+                };
+                let Some(mut gpu) = gpu_with(effects) else { return };
+                for _ in 0..20 {
+                    gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut dst, w * 2).unwrap();
+                }
+                let mut total = Duration::ZERO;
+                for _ in 0..FRAMES {
+                    total += gpu.process(FrameFormat::Raw(rgbx()), &src, w * 4, w, h, &mut dst, w * 2).unwrap()[2];
+                }
+                eprintln!("model {mw}x{mh}, {name}: gpu {:.2} ms/frame", total.as_secs_f64() * 1e3 / FRAMES as f64);
+            }
         }
     }
 
