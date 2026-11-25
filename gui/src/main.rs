@@ -239,8 +239,8 @@ impl App {
                 ui.label("Frame rate");
                 ui.label(format!("{:.1} fps", stats.fps));
                 ui.end_row();
-                ui.label("Per frame");
-                ui.label(format!("{:.2} ms", stats.ms_per_frame));
+                ui.label("Latency");
+                ui.label(format!("{:.2} ms", stats.latency_ms));
                 ui.end_row();
                 for (stage, ms) in &stats.stages {
                     ui.label(format!("  {stage}"));

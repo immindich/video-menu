@@ -24,7 +24,9 @@
 //! while the model works on the current frame in the background, which takes
 //! the model off the path from camera to output.
 
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use half::{f16, slice::HalfFloatSliceExt};
 use video_menu_protocol::ModelChoice;
@@ -92,7 +94,9 @@ pub trait Matte: Send {
 }
 
 /// Runs a [`Matte`] for each frame, either in step with the frames or one
-/// frame behind.
+/// frame behind: the serial counterpart of the worker's model thread, used
+/// by the serial [`crate::processor::Processor`].
+#[cfg(test)]
 pub struct Matting {
     matte: Box<dyn Matte>,
     /// Composite each frame with the previous frame's result, so the model
@@ -112,6 +116,7 @@ pub struct Matting {
     last: Duration,
 }
 
+#[cfg(test)]
 impl Matting {
     pub fn new(matte: Box<dyn Matte>, reuse: bool) -> Self {
         Self { matte, reuse, pending: false, started: false, first: Vec::new(), ready: false, last: Duration::ZERO }
@@ -134,10 +139,6 @@ impl Matting {
         self.reuse = reuse;
     }
 
-    /// See [`Matte::set_smoothing`].
-    pub fn set_smoothing(&mut self, strength: f32) {
-        self.matte.set_smoothing(strength);
-    }
 
     /// The coefficients to composite the frame whose model input is `src`
     /// with: that frame's own, or in reuse mode the previous frame's (the
@@ -213,6 +214,7 @@ impl Matting {
     }
 }
 
+#[cfg(test)]
 impl Drop for Matting {
     fn drop(&mut self) {
         // Don't free the model's buffers while it may still be using them.

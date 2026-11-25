@@ -78,6 +78,7 @@ enum Event {
     Reuse(bool),
     Smoothing(f32),
     Reset,
+    #[cfg(test)]
     Flush(mpsc::Sender<()>),
     Recycle(Vec<u8>),
     ModelDone { id: FrameId, a: Vec<f16>, b: Vec<f16>, input: Vec<f16>, time: Duration },
@@ -167,6 +168,7 @@ impl Worker {
 
     /// Wait until every frame sent so far has been finished or dropped and
     /// the model is idle.
+    #[cfg(test)]
     pub fn flush(&self) {
         let (tx, rx) = mpsc::channel();
         self.event(Event::Flush(tx));
@@ -326,6 +328,7 @@ impl Pipeline {
                 self.barrier();
                 self.reset();
             }
+            #[cfg(test)]
             Event::Flush(reply) => self.flushes.push(reply),
             Event::Recycle(frame) => self.out_pool.push(frame),
             Event::ModelDone { id, a, b, input, time } => {
@@ -468,8 +471,8 @@ impl Pipeline {
                 }
                 Action::Blur(slot) => {
                     let t = Instant::now();
-                    self.backend.blur(slot);
-                    if let Some(frame) = self.slots[slot].and_then(|id| self.frames.get_mut(&id)) {
+                    let blurred = self.backend.blur(slot);
+                    if let Some(frame) = self.slots[slot].and_then(|id| self.frames.get_mut(&id)).filter(|_| blurred) {
                         frame.stages[2] += t.elapsed();
                     }
                 }

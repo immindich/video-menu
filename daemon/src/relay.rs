@@ -46,7 +46,8 @@ use crate::{
     formats::{self, CameraMode, CaptureFormat, serialize},
     pipeline::InputFormat,
     pipeline::Background,
-    processor::{Effects, FrameFormat, Processor, STAGES},
+    processor::{Effects, FrameFormat, STAGES},
+    worker::{Job, Output, Worker},
 };
 
 pub const OUTPUT_NODE_NAME: &str = "video-menu.camera";
@@ -74,6 +75,11 @@ struct State {
     pts: i64,
     /// Frame sequence number of `frame`.
     seq: u64,
+    /// Sequence number for camera frames that come without one.
+    next_seq: u64,
+    /// Bumped whenever frames in flight become stale (capture stops, the
+    /// format or camera changes); finished frames from before are dropped.
+    generation: u64,
     /// Whether the capture stream is currently connected to the camera.
     capturing: bool,
     timing: Timing,
@@ -84,13 +90,15 @@ struct State {
 struct Window {
     frames: u32,
     stages: [Duration; 5],
+    latency: Duration,
     since: Option<Instant>,
 }
 
 impl Window {
-    fn add(&mut self, stages: [Duration; 5]) {
+    fn add(&mut self, stages: [Duration; 5], latency: Duration) {
         self.since.get_or_insert_with(Instant::now);
         self.frames += 1;
+        self.latency += latency;
         for (total, t) in self.stages.iter_mut().zip(stages) {
             *total += t;
         }
@@ -100,18 +108,19 @@ impl Window {
         self.since.map_or(Duration::ZERO, |s| s.elapsed())
     }
 
-    /// Average ms per frame overall and per stage, skipping stages that
-    /// took no time at all (e.g. decode, for raw frames).
+    /// Average latency (ms, camera to output) and time per stage, skipping
+    /// stages that took no time at all (e.g. decode, for raw frames). The
+    /// stages overlap between frames, so they add up to more than the
+    /// time between frames.
     fn averages(&self, names: [&str; 5]) -> (f64, Vec<(String, f64)>) {
         let ms = |d: Duration| d.as_secs_f64() * 1e3 / self.frames.max(1) as f64;
-        let total: Duration = self.stages.iter().sum();
         let stages = names
             .iter()
             .zip(self.stages)
             .filter(|(_, t)| !t.is_zero())
             .map(|(n, t)| (n.to_string(), ms(t)))
             .collect();
-        (ms(total), stages)
+        (ms(self.latency), stages)
     }
 }
 
@@ -122,21 +131,21 @@ struct Timing {
     log: Window,
     live: Window,
     /// Camera frames dropped because processing fell behind.
-    skipped: u32,
+    pub skipped: u32,
     /// The latest ~1 s statistics (without the backend) and when they were
     /// taken.
     latest: Option<(Instant, Stats)>,
 }
 
 impl Timing {
-    fn record(&mut self, stages: [Duration; 5], names: [&str; 5]) {
-        self.log.add(stages);
-        self.live.add(stages);
+    fn record(&mut self, stages: [Duration; 5], latency: Duration, names: [&str; 5]) {
+        self.log.add(stages, latency);
+        self.live.add(stages, latency);
         let elapsed = self.live.elapsed();
         if elapsed >= STATS_INTERVAL {
-            let (ms_per_frame, stages) = self.live.averages(names);
+            let (latency_ms, stages) = self.live.averages(names);
             let fps = self.live.frames as f64 / elapsed.as_secs_f64();
-            let stats = Stats { fps, ms_per_frame, stages, backend: String::new() };
+            let stats = Stats { fps, latency_ms, stages, backend: String::new() };
             self.latest = Some((Instant::now(), stats));
             self.live = Window::default();
         }
@@ -144,7 +153,7 @@ impl Timing {
             let (ms, stages) = self.log.averages(names);
             let stages: Vec<String> = stages.iter().map(|(n, t)| format!("{n} {t:.2}")).collect();
             eprintln!(
-                "pipeline: {} frames ({} skipped), {ms:.2} ms/frame ({})",
+                "pipeline: {} frames ({} skipped), {ms:.2} ms latency ({})",
                 self.log.frames,
                 self.skipped,
                 stages.join(", ")
@@ -246,11 +255,12 @@ pub struct CameraRelay {
     input: StreamRc,
     output: StreamRc,
     state: RefCell<State>,
-    /// Turns camera frames into processed YUY2 frames.
-    processor: RefCell<Processor>,
+    /// Turns camera frames into processed YUY2 frames, on threads of its
+    /// own; finished frames come back to [`on_processed`](Self::on_processed).
+    worker: Worker,
     /// Name of the video source being relayed, if any.
     camera: RefCell<Option<String>>,
-    /// The effect settings `processor` was set up with.
+    /// The effect settings `worker` was set up with.
     settings: RefCell<Settings>,
     /// Live list of video sources the relay could capture from.
     sources: VideoSources,
@@ -271,7 +281,7 @@ impl CameraRelay {
     pub fn new(
         core: &CoreRc,
         sources: VideoSources,
-        processor: Processor,
+        worker: Worker,
         settings: Settings,
     ) -> Result<Rc<Self>, pw::Error> {
         let input = StreamRc::new(
@@ -301,7 +311,7 @@ impl CameraRelay {
             input,
             output,
             state: RefCell::default(),
-            processor: RefCell::new(processor),
+            worker,
             camera: RefCell::default(),
             settings: RefCell::new(settings),
             sources,
@@ -346,7 +356,7 @@ impl CameraRelay {
 
         self.stop_capture();
         // The model's temporal state describes the old camera's scene.
-        self.processor.borrow_mut().reset();
+        self.worker.reset();
         self.set_target(name.unwrap_or(""))?;
         *self.camera.borrow_mut() = name.map(str::to_owned);
         match name {
@@ -375,7 +385,7 @@ impl CameraRelay {
     /// How the relay has been performing over the last second or so.
     pub fn stats(&self) -> Stats {
         let mut stats = self.state.borrow().timing.stats();
-        stats.backend = self.processor.borrow().describe();
+        stats.backend = self.worker.describe().to_string();
         stats
     }
 
@@ -410,9 +420,7 @@ impl CameraRelay {
 
     /// Turn reusing the previous frame's matte on or off.
     pub fn set_reuse_matte(&self, reuse: bool) {
-        if let Some(matting) = self.processor.borrow_mut().matting_mut() {
-            matting.set_reuse(reuse);
-        }
+        self.worker.set_reuse(reuse);
         self.settings.borrow_mut().reuse_matte = reuse;
         eprintln!("relay: matte reuse {}", if reuse { "on" } else { "off" });
     }
@@ -422,16 +430,15 @@ impl CameraRelay {
         if !(0.0..1.0).contains(&strength) {
             return Err(format!("selfie smoothing must be in 0..1, not {strength}"));
         }
-        if let Some(matting) = self.processor.borrow_mut().matting_mut() {
-            matting.set_smoothing(strength);
-        }
+        self.worker.set_smoothing(strength);
         self.settings.borrow_mut().selfie_smoothing = strength;
         Ok(())
     }
 
     /// Rebuild the effects if `new` needs different ones, then record it.
     /// Changing only the background (blur or colour, and their settings)
-    /// keeps the loaded model and takes effect from the next frame.
+    /// keeps the loaded model and takes effect from the next frame. Either
+    /// way capture goes on: the worker drops the frames in flight.
     fn apply(&self, new: Settings) -> Result<(), String> {
         let old = self.settings();
         let matte = new.effect.needs_matte();
@@ -441,19 +448,15 @@ impl CameraRelay {
             // missing model file) leaves it as it was.
             let (effects, description) =
                 Effects::load(new.background(), new.model, new.reuse_matte, new.selfie_smoothing)?;
-            self.stop_capture();
-            self.processor.borrow_mut().set_effects(effects);
+            self.worker.set_effects(effects);
             eprintln!("relay: now {description}");
         } else if let Some(background) = new.background()
             && new.background() != old.background()
         {
-            self.processor.borrow_mut().set_background(background);
+            self.worker.set_background(background);
             eprintln!("relay: background now {background:?}");
         }
         *self.settings.borrow_mut() = new;
-        if rebuild {
-            self.resume_capture();
-        }
         Ok(())
     }
 
@@ -586,6 +589,7 @@ impl CameraRelay {
             buffer = newer;
             skipped += 1;
         }
+        let arrived = Instant::now();
         // Consumers (e.g. GStreamer's pipewiresrc) timestamp frames from the
         // header meta; without advancing pts they show a still image.
         let header = buffer.find_meta::<MetaHeader>().map(|h| (h.pts(), h.seq()));
@@ -604,47 +608,75 @@ impl CameraRelay {
             return;
         };
 
-        {
+        // Copy the frame out, so the camera gets its buffer back at once
+        // while the worker processes the copy.
+        let job = {
             let st = &mut *self.state.borrow_mut();
             st.timing.skipped += skipped;
             let (Some(format), Some(input)) = (st.format, st.input) else {
                 return;
             };
             let (width, height) = (format.size().width as usize, format.size().height as usize);
-            let src_stride = match input {
-                _ if src_stride > 0 => src_stride as usize,
-                FrameFormat::Raw(raw) => raw.row_bytes(width),
-                FrameFormat::Mjpg => 0,
+            let mut copy = self.worker.buffer();
+            let stride = match input {
+                FrameFormat::Raw(raw) => {
+                    // Without the rows' padding.
+                    let row = raw.row_bytes(width);
+                    let src_stride = if src_stride > 0 { src_stride as usize } else { row };
+                    if !crate::pipeline::frame_fits(raw, src.len(), src_stride, width, height) {
+                        eprintln!("capture: dropping a short frame ({} bytes)", src.len());
+                        return;
+                    }
+                    for line in src.chunks(src_stride).take(height) {
+                        copy.extend_from_slice(&line[..row]);
+                    }
+                    row
+                }
+                FrameFormat::Mjpg => {
+                    copy.extend_from_slice(src);
+                    0
+                }
             };
-
-            st.frame.resize(st.stride * height, 0);
-            let mut processor = self.processor.borrow_mut();
-            match processor.process(
-                input,
-                src,
-                src_stride,
+            let (pts, seq) = match header {
+                Some((pts, seq)) if pts > 0 => (pts, seq),
+                _ => {
+                    st.next_seq = st.next_seq.wrapping_add(1);
+                    (self.start.elapsed().as_nanos() as i64, st.next_seq)
+                }
+            };
+            Job {
+                generation: st.generation,
+                format: input,
+                data: copy,
+                stride,
                 width,
                 height,
-                &mut st.frame,
-                st.stride,
-            ) {
-                Ok(stages) => st.timing.record(stages, STAGES),
-                Err(e) => {
-                    eprintln!("capture: dropping frame: {e}");
-                    return;
-                }
+                out_stride: st.stride,
+                pts,
+                seq,
+                arrived,
             }
-
-            (st.pts, st.seq) = match header {
-                Some((pts, seq)) if pts > 0 => (pts, seq),
-                _ => (
-                    self.start.elapsed().as_nanos() as i64,
-                    st.seq.wrapping_add(1),
-                ),
-            };
-        }
+        };
         drop(buffer);
+        self.worker.send(job);
+    }
 
+    /// The worker finished a frame: make it the one the virtual camera hands
+    /// out, unless it's from before a change that made it stale.
+    pub fn on_processed(&self, out: Output) {
+        let mut st = self.state.borrow_mut();
+        let height = st.format.map_or(0, |f| f.size().height as usize);
+        if out.generation != st.generation || !st.capturing || out.frame.len() != st.stride * height {
+            drop(st);
+            self.worker.recycle(out.frame);
+            return;
+        }
+        st.timing.skipped += out.dropped;
+        st.timing.record(out.stages, out.latency, STAGES);
+        let old = std::mem::replace(&mut st.frame, out.frame);
+        (st.pts, st.seq) = (out.pts, out.seq);
+        drop(st);
+        self.worker.recycle(old);
         if let Err(e) = self.output.trigger_process() {
             eprintln!("camera: trigger_process failed: {e}");
         }
@@ -713,6 +745,7 @@ impl CameraRelay {
             st.input = None;
             st.frame.clear();
             st.timing = Timing::default();
+            st.generation += 1;
         }
         if let Err(e) = self.input.disconnect() {
             eprintln!("capture: disconnect failed: {e}");

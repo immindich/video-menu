@@ -7,6 +7,7 @@
 //! Set `VIDEO_MENU_BACKEND=cpu` or `=gpu` to force a backend; `gpu` fails
 //! instead of falling back.
 
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use half::f16;
@@ -14,9 +15,11 @@ use pipewire::spa::param::video::VideoFormat;
 
 use video_menu_protocol::ModelChoice;
 
+#[cfg(test)]
+use crate::model::Matting;
 use crate::{
     gpu::GpuProcessor,
-    model::{self, Matte, Matting},
+    model::{self, Matte},
     pipeline::{self, Background, CpuProcessor, InputFormat, PlanarFrame},
 };
 
@@ -140,7 +143,7 @@ impl Backend {
     }
 
     /// See [`CpuProcessor::blur`].
-    pub fn blur(&mut self, slot: usize) {
+    pub fn blur(&mut self, slot: usize) -> bool {
         match self {
             Self::Cpu(cpu) => cpu.blur(slot),
             Self::Gpu(gpu) => gpu.blur(slot),
@@ -162,6 +165,7 @@ impl Backend {
     }
 
     /// Note an event in the GPU profile, if profiling.
+    #[cfg(test)]
     fn mark(&self, name: &'static str) {
         if let Self::Gpu(gpu) = self {
             gpu.mark(name);
@@ -173,7 +177,10 @@ impl Backend {
 /// raw frames, `blur` without a blur, and `model` without a model.
 pub const STAGES: [&str; 5] = ["decode", "ingest", "blur", "model", "finish"];
 
-/// Runs frames through a backend and the matting model, one at a time.
+/// Runs frames through a backend and the matting model, one at a time:
+/// the serial reference the threaded [`crate::worker`] is tested against,
+/// and what the benchmarks use.
+#[cfg(test)]
 pub struct Processor {
     backend: Backend,
     /// The model, for an effect that runs one.
@@ -185,6 +192,7 @@ pub struct Processor {
     decoder: Decoder,
 }
 
+#[cfg(test)]
 impl Processor {
     pub fn new(backend: Backend, effects: Effects) -> Self {
         let mut processor = Self {
@@ -208,10 +216,6 @@ impl Processor {
         Ok(Self::new(Backend::Gpu(Box::new(GpuProcessor::new()?)), effects))
     }
 
-    /// The backend chosen by `VIDEO_MENU_BACKEND`; see [`Backend::from_env`].
-    pub fn from_env(effects: Effects) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self::new(Backend::from_env()?, effects))
-    }
 
     /// Replace the effects, e.g. to switch models.
     pub fn set_effects(&mut self, effects: Effects) {
@@ -225,10 +229,6 @@ impl Processor {
         self.backend.reset_alpha();
     }
 
-    /// The matting model the effects run, if any, to change its settings.
-    pub fn matting_mut(&mut self) -> Option<&mut Matting> {
-        self.matting.as_mut()
-    }
 
     /// Change what the background effect, if any, puts behind the person.
     pub fn set_background(&mut self, background: Background) {
@@ -245,9 +245,6 @@ impl Processor {
         self.backend.reset_alpha();
     }
 
-    pub fn describe(&self) -> String {
-        self.backend.describe()
-    }
 
     /// Turn one `width`x`height` camera frame into YUY2 in `dst` (rows
     /// `dst_stride` apart, `dst_stride * height` bytes). `src_stride` is

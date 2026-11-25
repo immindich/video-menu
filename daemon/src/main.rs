@@ -53,10 +53,7 @@ mod pipeline;
 mod processor;
 mod profile;
 mod relay;
-// The relay starts using these in the next commit.
-#[allow(dead_code)]
 mod scheduler;
-#[allow(dead_code)]
 mod worker;
 
 use std::{error::Error, rc::Rc};
@@ -64,7 +61,7 @@ use std::{error::Error, rc::Rc};
 use pipewire as pw;
 use pw::{context::ContextRc, main_loop::MainLoopRc};
 
-use processor::{Effects, Processor};
+use processor::{Backend, Effects};
 use relay::{CameraRelay, OUTPUT_NODE_NAME, Settings, VideoSources, roundtrip};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -106,9 +103,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         settings.selfie_smoothing,
     )?;
     eprintln!("effect: {description}");
-    let processor = Processor::from_env(effects)?;
-    eprintln!("processing frames on the {}", processor.describe());
-    let relay = CameraRelay::new(&core, sources, processor, settings)?;
+    // Frames are processed on the worker's threads and come back here.
+    let (processed, processed_rx) = pw::channel::channel::<worker::Output>();
+    let worker = worker::Worker::start(Backend::from_env()?, effects, move |out| {
+        let _ = processed.send(out);
+    });
+    eprintln!("processing frames on the {}", worker.describe());
+    let relay = CameraRelay::new(&core, sources, worker, settings)?;
+    let _processed = processed_rx.attach(mainloop.loop_(), {
+        let relay = relay.clone();
+        move |out| relay.on_processed(out)
+    });
     let _listeners = relay.listen()?;
     match &initial {
         Some(camera) => relay.set_camera(Some(camera))?,

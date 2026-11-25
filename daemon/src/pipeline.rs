@@ -476,10 +476,11 @@ impl CpuProcessor {
     }
 
     /// Blur the background of the frame in `slot`, if its effect is a blur,
-    /// weighing pixels by the alpha of the last finished frame.
-    pub fn blur(&mut self, slot: usize) {
-        let Some(job) = self.slots[slot].job.as_mut() else { return };
-        let Some(Background::Blur { radius }) = job.background.filter(|_| !job.blurred) else { return };
+    /// weighing pixels by the alpha of the last finished frame. Returns
+    /// whether there was anything to blur.
+    pub fn blur(&mut self, slot: usize) -> bool {
+        let Some(job) = self.slots[slot].job.as_mut() else { return false };
+        let Some(Background::Blur { radius }) = job.background.filter(|_| !job.blurred) else { return false };
         job.blurred = true;
         let s = &mut self.slots[slot];
         let frame = &s.frame;
@@ -505,6 +506,7 @@ impl CpuProcessor {
         blur_pass(b, a, &g, &kernel, false);
         s.blurred.resize(4 * pixels, 0.0);
         resample(a, g.width, g.height, &mut s.blurred, w, h, 4);
+        true
     }
 
     /// Composite the frame in `slot` with the model's coefficients (for an

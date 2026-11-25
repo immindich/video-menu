@@ -27,8 +27,9 @@ pub const INTERFACE: &str = "io.github.immindich.VideoMenu.Relay1";
 pub struct Stats {
     /// Frames processed per second (0 when nothing is streaming).
     pub fps: f64,
-    /// Average processing time per frame, in milliseconds.
-    pub ms_per_frame: f64,
+    /// Average time from the camera to the virtual camera, in
+    /// milliseconds.
+    pub latency_ms: f64,
     /// Average time per pipeline stage (name, milliseconds), in order.
     pub stages: Vec<(String, f64)>,
     /// Where frames are processed, e.g. "GPU (Intel(R) Graphics (PTL))".

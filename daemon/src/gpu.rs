@@ -379,14 +379,16 @@ impl GpuProcessor {
     /// Start blurring the background of the frame in `slot`, if its effect
     /// is a blur, weighing pixels by the alpha of the last finished frame.
     /// Doesn't wait; [`finish`](Self::finish) blurs if this wasn't called.
-    pub fn blur(&mut self, slot: usize) {
-        let Some(job) = self.slots.get_mut(slot).and_then(|s| s.job.as_mut()) else { return };
-        let Some(g) = job.blur.filter(|_| !job.blurred) else { return };
+    /// Returns whether there was anything to blur.
+    pub fn blur(&mut self, slot: usize) -> bool {
+        let Some(job) = self.slots.get_mut(slot).and_then(|s| s.job.as_mut()) else { return false };
+        let Some(g) = job.blur.filter(|_| !job.blurred) else { return false };
         job.blurred = true;
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.record_blur(&mut encoder, slot, &g);
         self.queue.submit([encoder.finish()]);
         self.submitted("blur");
+        true
     }
 
     fn record_blur(&mut self, encoder: &mut wgpu::CommandEncoder, slot: usize, g: &BlurGeometry) {
