@@ -80,6 +80,12 @@ impl Scheduler {
         self.free.pop().expect("a free slot (the worker ingests one frame at a time)")
     }
 
+    /// Give back a slot from [`take_slot`](Self::take_slot) that wasn't
+    /// used (the frame failed to ingest).
+    pub fn release_slot(&mut self, slot: usize) {
+        self.free.push(slot);
+    }
+
     /// A frame was ingested into `slot`; `wants_model` if its effect runs
     /// the model (its input is ready). Whether the effect runs the model
     /// only changes across a [`barrier`](Self::barrier).
@@ -156,6 +162,20 @@ impl Scheduler {
                 // Its blur needed the frame before it finished.
                 actions.push(Action::Blur(slot));
             }
+        }
+        actions
+    }
+
+    /// The model failed on frame `id`: drop it, and give the model the
+    /// waiting frame, if any.
+    pub fn model_failed(&mut self, id: FrameId) -> Vec<Action> {
+        let failed = self.in_model.take().expect("the model failed a frame it was given");
+        assert_eq!(failed.id, id, "the model failed frames out of order");
+        let mut actions = vec![self.drop_frame(failed)];
+        if !std::mem::take(&mut self.discard)
+            && let Some(next) = self.waiting.take()
+        {
+            actions.extend(self.offer(next));
         }
         actions
     }
@@ -299,6 +319,18 @@ mod tests {
         // finished with its own result.
         assert_eq!(s.model_done(2), [Dispatch(3), Blur(c)]);
         assert_eq!(s.model_done(3), [Finish { id: 3, slot: c, model: true }]);
+        assert_eq!(s.free_slots(), 3);
+    }
+
+    #[test]
+    fn failed_frame_is_dropped_and_the_next_goes_to_the_model() {
+        let mut s = Scheduler::new(3, false);
+        let a = s.take_slot();
+        s.ingested(1, a, true);
+        let b = s.take_slot();
+        s.ingested(2, b, true);
+        assert_eq!(s.model_failed(1), [Drop { id: 1, slot: Some(a) }, Dispatch(2), Blur(b)]);
+        assert_eq!(s.model_done(2), [Finish { id: 2, slot: b, model: true }]);
         assert_eq!(s.free_slots(), 3);
     }
 

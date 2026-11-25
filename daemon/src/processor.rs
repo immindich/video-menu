@@ -16,7 +16,7 @@ use video_menu_protocol::ModelChoice;
 
 use crate::{
     gpu::GpuProcessor,
-    model::{self, Matting},
+    model::{self, Matte, Matting},
     pipeline::{self, Background, CpuProcessor, InputFormat, PlanarFrame},
 };
 
@@ -24,8 +24,10 @@ use crate::{
 pub enum Effects {
     /// Nothing: frames pass through unchanged.
     None,
-    /// Replace the background, finding it with a matting model.
-    Background(Matting, Background),
+    /// Replace the background, finding it with a matting model. With
+    /// `reuse`, frames are composited with the model's latest result
+    /// rather than waiting for their own.
+    Background { matte: Box<dyn Matte>, reuse: bool, background: Background },
 }
 
 impl Effects {
@@ -47,7 +49,7 @@ impl Effects {
             Background::Blur { .. } => "blurred background",
         };
         Ok((
-            Self::Background(Matting::new(matte, reuse), background),
+            Self::Background { matte, reuse, background },
             format!("{what} with {description}{reuse_note}"),
         ))
     }
@@ -180,12 +182,7 @@ pub struct Processor {
     background: Option<Background>,
     /// Size of the last frame; temporal state is reset when it changes.
     size: (usize, usize),
-    /// JPEG decoder, created on the first MJPG frame.
-    jpeg: Option<turbojpeg::Decompressor>,
-    /// The last decoded MJPG frame, as RGBx.
-    decoded: Vec<u8>,
-    /// Makes the model's input from MJPG frames, before the full decode.
-    early: EarlyInput,
+    decoder: Decoder,
 }
 
 impl Processor {
@@ -195,9 +192,7 @@ impl Processor {
             matting: None,
             background: None,
             size: (0, 0),
-            jpeg: None,
-            decoded: Vec::new(),
-            early: EarlyInput::default(),
+            decoder: Decoder::default(),
         };
         processor.set_effects(effects);
         processor
@@ -222,9 +217,9 @@ impl Processor {
     pub fn set_effects(&mut self, effects: Effects) {
         (self.matting, self.background) = match effects {
             Effects::None => (None, None),
-            Effects::Background(matting, background) => {
-                self.backend.set_model_size(matting.size());
-                (Some(matting), Some(background))
+            Effects::Background { matte, reuse, background } => {
+                self.backend.set_model_size(matte.size());
+                (Some(Matting::new(matte, reuse)), Some(background))
             }
         };
         self.backend.reset_alpha();
@@ -272,22 +267,14 @@ impl Processor {
             self.reset();
             self.size = (width, height);
         }
-        let mut early = false;
-        let (input, src, src_stride, decode) = match format {
-            FrameFormat::Raw(input) => (input, src, src_stride, Duration::ZERO),
-            FrameFormat::Mjpg => {
-                let start = Instant::now();
-                // The model's input first, from a scaled-down decode, so the
-                // model can start before the full decode.
-                if let Some(matting) = &self.matting {
-                    early = self.early.make(src, (width, height), matting.size())?;
-                }
-                self.decode_jpeg(src, width, height)?;
-                let rgbx = InputFormat::from_video_format(VideoFormat::RGBx).unwrap();
-                (rgbx, self.decoded.as_slice(), width * 4, start.elapsed())
-            }
+        let t = Instant::now();
+        let model_size = self.matting.as_ref().map(|m| m.size());
+        let frame = self.decoder.decode(format, src, src_stride, width, height, model_size)?;
+        let (input, src, src_stride, model_input) = (frame.input, frame.src, frame.stride, frame.model_input);
+        let decode = match format {
+            FrameFormat::Raw(_) => Duration::ZERO,
+            FrameFormat::Mjpg => t.elapsed(),
         };
-        let model_input = early.then_some(self.early.input.as_slice());
         let background = self.background.filter(|_| self.matting.is_some());
 
         let t = Instant::now();
@@ -313,6 +300,61 @@ impl Processor {
             None => self.backend.finish(0, None, dst, dst_stride)?,
         }
         Ok([decode, ingest, blur, model, t.elapsed()])
+    }
+
+}
+
+/// A camera frame ready for a backend's ingest stage.
+pub struct Decoded<'a> {
+    pub input: InputFormat,
+    pub src: &'a [u8],
+    pub stride: usize,
+    /// The model's input, if it was made while decoding (MJPG).
+    pub model_input: Option<&'a [f16]>,
+}
+
+/// Decodes MJPG frames (raw frames pass through), making the model's input
+/// first from a scaled-down decode (see [`EarlyInput`]).
+#[derive(Default)]
+pub struct Decoder {
+    /// JPEG decoder, created on the first MJPG frame.
+    jpeg: Option<turbojpeg::Decompressor>,
+    /// The last decoded MJPG frame, as RGBx.
+    decoded: Vec<u8>,
+    early: EarlyInput,
+}
+
+impl Decoder {
+    /// Decode a `width`x`height` frame; with `model` (the size of the model
+    /// the effect runs), also make the model's input early where that
+    /// saves time.
+    pub fn decode<'a>(
+        &'a mut self,
+        format: FrameFormat,
+        src: &'a [u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        model: Option<(usize, usize)>,
+    ) -> Result<Decoded<'a>, String> {
+        match format {
+            FrameFormat::Raw(input) => Ok(Decoded { input, src, stride: src_stride, model_input: None }),
+            FrameFormat::Mjpg => {
+                // The model's input first, from a scaled-down decode, so the
+                // model can start before the full decode.
+                let early = match model {
+                    Some(size) => self.early.make(src, (width, height), size)?,
+                    None => false,
+                };
+                self.decode_jpeg(src, width, height)?;
+                Ok(Decoded {
+                    input: InputFormat::from_video_format(VideoFormat::RGBx).unwrap(),
+                    src: &self.decoded,
+                    stride: width * 4,
+                    model_input: early.then_some(self.early.input.as_slice()),
+                })
+            }
+        }
     }
 
     /// Decode a JPEG frame into `self.decoded` as RGBx, checking it is the
@@ -607,7 +649,7 @@ mod tests {
             ((256, 144), Background::Blur { radius: 8.0 }),
         ];
         for ((mw, mh), bg) in cases {
-            let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false), bg);
+            let fake = || Effects::Background { matte: Box::new(FakeMatte::with_size(mw, mh)), reuse: false, background: bg };
             let Some(gpu) = gpu_with(fake()) else { return };
             background_matches(gpu, Processor::cpu(fake()), (mw, mh), bg);
         }
@@ -616,7 +658,7 @@ mod tests {
     #[test]
     fn background_can_change_in_place() {
         use crate::model::fake::FakeMatte;
-        let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(256, 144)), false), GREEN);
+        let fake = || Effects::Background { matte: Box::new(FakeMatte::with_size(256, 144)), reuse: false, background: GREEN };
         let Some(mut gpu) = gpu_with(fake()) else { return };
         let mut cpu = Processor::cpu(fake());
         let blur = Background::Blur { radius: 3.0 };
@@ -665,7 +707,7 @@ mod tests {
             for (name, bg) in cases {
                 let effects = match bg {
                     None => Effects::None,
-                    Some(bg) => Effects::Background(Matting::new(Box::new(FakeMatte::with_size(mw, mh)), false), bg),
+                    Some(bg) => Effects::Background { matte: Box::new(FakeMatte::with_size(mw, mh)), reuse: false, background: bg },
                 };
                 let Some(mut gpu) = gpu_with(effects) else { return };
                 for _ in 0..20 {
@@ -696,7 +738,7 @@ mod tests {
     fn mjpg_background_gpu_matches_cpu() {
         use crate::model::fake::FakeMatte;
         for bg in [GREEN, Background::Blur { radius: 2.0 }] {
-            let fake = || Effects::Background(Matting::new(Box::new(FakeMatte::with_size(480, 270)), false), bg);
+            let fake = || Effects::Background { matte: Box::new(FakeMatte::with_size(480, 270)), reuse: false, background: bg };
             let Some(mut gpu) = gpu_with(fake()) else { return };
             let mut cpu = Processor::cpu(fake());
             // Early input from a 3/4 and a 1/2 scale decode.
@@ -727,7 +769,7 @@ mod tests {
         let img = turbojpeg::decompress(&jpg, turbojpeg::PixelFormat::RGBX).unwrap();
         let (w, h) = (img.width, img.height);
         let choice = model::choice_from_env().unwrap();
-        let effects = || Effects::Background(Matting::new(model::load(choice, 0.5).unwrap().0, false), GREEN);
+        let effects = || Effects::Background { matte: model::load(choice, 0.5).unwrap().0, reuse: false, background: GREEN };
         let run = |format: FrameFormat, src: &[u8], stride: usize| {
             let mut proc = Processor::gpu(effects()).unwrap();
             let mut dst = vec![0u8; w * 2 * h];
@@ -776,7 +818,7 @@ mod tests {
 
     fn real_model_with(choice: ModelChoice, label: &str, bg: Background, jpg: &[u8], (w, h): (usize, usize)) {
         const FRAMES: usize = 8;
-        let matte = || Effects::Background(Matting::new(model::load(choice, 0.5).unwrap().0, false), bg);
+        let matte = || Effects::Background { matte: model::load(choice, 0.5).unwrap().0, reuse: false, background: bg };
         let mut outputs = Vec::new();
         for (name, mut proc) in [("cpu", Processor::cpu(matte())), ("gpu", Processor::gpu(matte()).unwrap())] {
             let mut dst = vec![0u8; w * 2 * h];

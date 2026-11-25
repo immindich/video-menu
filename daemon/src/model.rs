@@ -63,7 +63,8 @@ const RECURRENT: [(&str, i64, i64); 4] = [("r1", 16, 2), ("r2", 20, 4), ("r3", 4
 
 /// Something that turns a downsampled frame into refiner coefficients,
 /// possibly in the background.
-pub trait Matte {
+/// `Send`, so the model can run on a thread of its own.
+pub trait Matte: Send {
     /// The resolution (width, height) the model works at.
     fn size(&self) -> (usize, usize);
 

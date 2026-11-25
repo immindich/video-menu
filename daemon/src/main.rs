@@ -53,9 +53,11 @@ mod pipeline;
 mod processor;
 mod profile;
 mod relay;
-// Used by the worker (next commit); tested on its own here.
-#[cfg_attr(not(test), allow(dead_code))]
+// The relay starts using these in the next commit.
+#[allow(dead_code)]
 mod scheduler;
+#[allow(dead_code)]
+mod worker;
 
 use std::{error::Error, rc::Rc};
 
