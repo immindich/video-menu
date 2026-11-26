@@ -58,10 +58,36 @@
         ps.openvino
         ps.onnx
       ]);
+
+      video-menu = pkgs.rustPlatform.buildRustPackage
+        (finalAttrs: {
+          pname = "video-menu";
+          version = "0.1.0";
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            rustPlatform.bindgenHook
+          ];
+
+          buildInputs = with pkgs; [
+            pipewire
+            openvino
+            vulkan-loader
+            level-zero
+            libjpeg_turbo
+          ];
+
+          OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
+
+          src = ./.;
+          cargoHash = "sha256-Dm6bs1rgSuP1BntWum2eB96IGauIhroeD5PKJB/ND7I=";
+          cargoDepsName = finalAttrs.pname;
+        });
     in {
       packages.x86_64-linux.rvm-model = rvm-model;
       packages.x86_64-linux.selfie-model = selfie-model;
-
+      packages.x86_64-linux.default = video-menu;
+      
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = with pkgs; [
           cargo
@@ -74,14 +100,9 @@
           vulkan-validation-layers
           shaderc
         ];
-        nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook ];
-        buildInputs = with pkgs; [
-          pipewire
-          openvino
-          vulkan-loader
-          level-zero
-          libjpeg_turbo
-        ];
+
+        inputsFrom = [ video-menu ];
+
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         OPENVINO_INSTALL_DIR = "${pkgs.openvino}";
         VIDEO_MENU_MODEL = "${rvm-model}/rvm_mobilenetv3_fp16_core.onnx";
