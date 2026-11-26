@@ -12,7 +12,7 @@
 //! with no camera selected.
 //!
 //! The daemon is controlled over D-Bus (see [`dbus`] and the
-//! `video-menu-protocol` crate): it owns `io.github.immindich.VideoMenu` on
+//! `video-menu-protocol` crate): it owns `computer.isaiah.VideoMenu` on
 //! the session bus, so only one can run at a time. The environment variables
 //! below set its starting settings.
 //!

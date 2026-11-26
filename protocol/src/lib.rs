@@ -6,9 +6,9 @@
 //! shell:
 //!
 //! ```text
-//! busctl --user introspect io.github.immindich.VideoMenu /io/github/immindich/VideoMenu/Relay
-//! busctl --user set-property io.github.immindich.VideoMenu /io/github/immindich/VideoMenu/Relay \
-//!     io.github.immindich.VideoMenu.Relay1 Model s selfie
+//! busctl --user introspect computer.isaiah.VideoMenu /computer/isaiah/VideoMenu/Relay
+//! busctl --user set-property computer.isaiah.VideoMenu /computer/isaiah/VideoMenu/Relay \
+//!     computer.isaiah.VideoMenu.Relay1 Model s selfie
 //! ```
 
 use std::{fmt, str::FromStr};
@@ -16,11 +16,11 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 /// Well-known name the daemon owns on the session bus.
-pub const BUS_NAME: &str = "io.github.immindich.VideoMenu";
+pub const BUS_NAME: &str = "computer.isaiah.VideoMenu";
 /// Object path of the relay.
-pub const OBJECT_PATH: &str = "/io/github/immindich/VideoMenu/Relay";
+pub const OBJECT_PATH: &str = "/computer/isaiah/VideoMenu/Relay";
 /// The relay's interface. The version suffix changes on incompatible changes.
-pub const INTERFACE: &str = "io.github.immindich.VideoMenu.Relay1";
+pub const INTERFACE: &str = "computer.isaiah.VideoMenu.Relay1";
 
 /// How the relay has been performing, averaged over about a second.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, zbus::Type)]
@@ -46,9 +46,9 @@ pub struct Stats {
 /// being relayed, or empty for none; `Sources` lists (node name, has the
 /// Camera role) for every video source the daemon could use.
 #[zbus::proxy(
-    interface = "io.github.immindich.VideoMenu.Relay1",
-    default_service = "io.github.immindich.VideoMenu",
-    default_path = "/io/github/immindich/VideoMenu/Relay"
+    interface = "computer.isaiah.VideoMenu.Relay1",
+    default_service = "computer.isaiah.VideoMenu",
+    default_path = "/computer/isaiah/VideoMenu/Relay"
 )]
 pub trait Relay {
     /// Relay from the named source, or from none if `name` is empty.

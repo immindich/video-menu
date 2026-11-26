@@ -212,7 +212,7 @@ impl RelayInterface {
     }
 }
 
-#[zbus::interface(name = "io.github.immindich.VideoMenu.Relay1")]
+#[zbus::interface(name = "computer.isaiah.VideoMenu.Relay1")]
 impl RelayInterface {
     /// Relay from the named source, or from none if `name` is empty.
     async fn set_camera(&self, name: String) -> fdo::Result<()> {
